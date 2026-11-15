@@ -1,0 +1,9 @@
+# Submarine sync server — HTTPS in front of the app (docker compose --profile https).
+# Caddy gets and renews the certificate for SUBMARINE_DOMAIN by itself.
+{$SUBMARINE_DOMAIN} {
+	request_body {
+		max_size 6MB
+	}
+	reverse_proxy app:8080
+	header -Server
+}

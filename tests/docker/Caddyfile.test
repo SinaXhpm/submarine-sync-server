@@ -1,0 +1,9 @@
+# The repository's Caddyfile, with Caddy's own test CA instead of Let's Encrypt.
+localhost, sync.example.test {
+	tls internal
+	request_body {
+		max_size 6MB
+	}
+	reverse_proxy app:8080
+	header -Server
+}

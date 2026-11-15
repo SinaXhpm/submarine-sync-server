@@ -1,0 +1,31 @@
+# Submarine sync server — Apache rules for the public/ folder.
+# The Docker image uses these too.
+
+Options -Indexes -MultiViews
+DirectoryIndex index.php
+ServerSignature Off
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    # Keep the token header on hosts that run PHP through CGI/FastCGI.
+    RewriteCond %{HTTP:Authorization} ^(.+)$
+    RewriteRule ^ - [E=HTTP_AUTHORIZATION:%1]
+    # Every request goes to index.php, whatever its path.
+    RewriteRule ^index\.php$ - [END]
+    RewriteRule ^ index.php [QSA,END]
+</IfModule>
+
+# Sync requests carry up to 4 MB of JSON.
+LimitRequestBody 6291456
+
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "DENY"
+    Header always set Referrer-Policy "no-referrer"
+    Header always unset X-Powered-By
+</IfModule>
+
+# Nothing but index.php is ever served from here (not this file, not .user.ini).
+<FilesMatch "^\.">
+    Require all denied
+</FilesMatch>

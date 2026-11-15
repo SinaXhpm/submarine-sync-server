@@ -1,0 +1,12 @@
+.git
+.gitignore
+.gitattributes
+.env
+.env.*
+!.env.example
+config.php
+tests
+docker-compose.yml
+Caddyfile
+setup.sh
+*.md

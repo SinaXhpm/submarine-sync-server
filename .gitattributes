@@ -1,0 +1,3 @@
+# Unix line endings everywhere (shell scripts and PHP run on Linux).
+* text=auto eol=lf
+*.png binary

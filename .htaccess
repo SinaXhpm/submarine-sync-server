@@ -1,0 +1,19 @@
+# Submarine sync server — only used when this whole folder is the web root.
+# Better: point the web root (the domain's "document root") at public/.
+# Then this file does nothing.
+#
+# Every request goes to public/index.php; nothing else here (config.php, src/,
+# bin/, schema.sql) can be fetched.
+
+Options -Indexes -MultiViews
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteCond %{HTTP:Authorization} ^(.+)$
+    RewriteRule ^ - [E=HTTP_AUTHORIZATION:%1]
+    RewriteRule ^ public/index.php [QSA,END]
+</IfModule>
+
+<IfModule !mod_rewrite.c>
+    Require all denied
+</IfModule>

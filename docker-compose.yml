@@ -1,0 +1,134 @@
+# Submarine sync server with Docker Compose.
+#
+#   ./setup.sh                              # makes .env with random secrets
+#   docker compose up -d                    # the server, on http://127.0.0.1:8080
+#   docker compose --profile https up -d    # plus Caddy: HTTPS on ports 80/443
+#                                           # for SUBMARINE_DOMAIN (set it in .env)
+#
+# Settings come from .env; see .env.example and README.md.
+
+name: submarine-sync
+
+services:
+  db:
+    image: mariadb:11.4.12
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: submarine
+      MARIADB_USER: submarine
+      MARIADB_PASSWORD: ${SUBMARINE_DB_PASSWORD:?Set SUBMARINE_DB_PASSWORD in .env (run ./setup.sh)}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?Set MARIADB_ROOT_PASSWORD in .env (run ./setup.sh)}
+      MARIADB_AUTO_UPGRADE: "1"
+    volumes:
+      - db:/var/lib/mysql
+    # No ports: only the app reaches the database.
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 10
+
+  app:
+    build: .
+    image: ${SUBMARINE_IMAGE:-submarine-sync-server:local}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment: &app-env
+      SUBMARINE_DB_HOST: db
+      SUBMARINE_DB_PORT: "3306"
+      SUBMARINE_DB_NAME: submarine
+      SUBMARINE_DB_USER: submarine
+      SUBMARINE_DB_PASSWORD: ${SUBMARINE_DB_PASSWORD}
+      SUBMARINE_TOKEN_PEPPER: ${SUBMARINE_TOKEN_PEPPER:?Set SUBMARINE_TOKEN_PEPPER in .env (run ./setup.sh)}
+      SUBMARINE_SIGNUP: ${SUBMARINE_SIGNUP:-invite}
+      SUBMARINE_MAX_ACCOUNTS: ${SUBMARINE_MAX_ACCOUNTS:-0}
+      SUBMARINE_BASE_PATH: ${SUBMARINE_BASE_PATH:-}
+      SUBMARINE_TOKEN_TTL_DAYS: ${SUBMARINE_TOKEN_TTL_DAYS:-}
+      # Caddy (the https profile) is the proxy in front. Without it the name
+      # doesn't resolve and nobody is trusted; the name is only looked up for
+      # a request from a private address that carries the header.
+      SUBMARINE_TRUSTED_PROXIES: ${SUBMARINE_TRUSTED_PROXIES:-caddy}
+      SUBMARINE_CLIENT_IP_HEADER: ${SUBMARINE_CLIENT_IP_HEADER:-X-Forwarded-For}
+      SUBMARINE_KEYS_NEED_PASSWORD: ${SUBMARINE_KEYS_NEED_PASSWORD:-}
+      SUBMARINE_MAIL_TRANSPORT: ${SUBMARINE_MAIL_TRANSPORT:-off}
+      SUBMARINE_MAIL_FROM: ${SUBMARINE_MAIL_FROM:-}
+      SUBMARINE_MAIL_FROM_NAME: ${SUBMARINE_MAIL_FROM_NAME:-Submarine sync}
+      SUBMARINE_SMTP_HOST: ${SUBMARINE_SMTP_HOST:-}
+      SUBMARINE_SMTP_PORT: ${SUBMARINE_SMTP_PORT:-587}
+      SUBMARINE_SMTP_SECURITY: ${SUBMARINE_SMTP_SECURITY:-starttls}
+      SUBMARINE_SMTP_USER: ${SUBMARINE_SMTP_USER:-}
+      SUBMARINE_SMTP_PASSWORD: ${SUBMARINE_SMTP_PASSWORD:-}
+      SUBMARINE_SMTP_VERIFY_PEER: ${SUBMARINE_SMTP_VERIFY_PEER:-}
+      SUBMARINE_MAIL_PER_HOUR: ${SUBMARINE_MAIL_PER_HOUR:-}
+      SUBMARINE_ADMIN_PASSWORD_HASH: ${SUBMARINE_ADMIN_PASSWORD_HASH:-}
+      SUBMARINE_ADMIN_PATH: ${SUBMARINE_ADMIN_PATH:-/admin}
+      SUBMARINE_ADMIN_ALLOW_HTTP_LOCAL: ${SUBMARINE_ADMIN_ALLOW_HTTP_LOCAL:-}
+      SUBMARINE_QUOTA_MB: ${SUBMARINE_QUOTA_MB:-5}
+      SUBMARINE_QUOTA_RECORDS: ${SUBMARINE_QUOTA_RECORDS:-}
+      SUBMARINE_QUOTA_PROFILES: ${SUBMARINE_QUOTA_PROFILES:-}
+      SUBMARINE_QUOTA_SHARES: ${SUBMARINE_QUOTA_SHARES:-}
+      SUBMARINE_LOGIN_FLOOR_MS: ${SUBMARINE_LOGIN_FLOOR_MS:-1000}
+    ports:
+      # Only this computer by default. The app accepts plain http only for
+      # localhost; anything else goes through HTTPS (the https profile).
+      - "${SUBMARINE_HTTP_BIND:-127.0.0.1}:${SUBMARINE_HTTP_PORT:-8080}:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run/apache2
+      - /var/lock/apache2
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  # Clean-up once an hour (expired sign-ins and codes, old logs).
+  cron:
+    image: ${SUBMARINE_IMAGE:-submarine-sync-server:local}
+    pull_policy: never   # built by the app service
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment: *app-env
+    command: ["php", "bin/cron.php", "--loop"]
+    healthcheck:
+      disable: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  # HTTPS with a free Let's Encrypt certificate. Needs a domain name that
+  # points at this machine, and ports 80 and 443 open to the internet.
+  caddy:
+    image: caddy:2.11.7-alpine
+    profiles: ["https"]
+    restart: unless-stopped
+    # It binds ports 80 and 443 inside its container, and needs nothing else.
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      - app
+    environment:
+      SUBMARINE_DOMAIN: ${SUBMARINE_DOMAIN:-}
+    command:
+      - sh
+      - -c
+      - '[ -n "$$SUBMARINE_DOMAIN" ] || { echo "Set SUBMARINE_DOMAIN in .env (your domain name) for HTTPS." >&2; exit 1; }; exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile'
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  db:
+  caddy_data:
+  caddy_config:

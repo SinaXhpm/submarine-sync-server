@@ -1,0 +1,10 @@
+# Test override for the https profile: Caddy with its own CA (no Let's Encrypt)
+# for localhost and sync.example.test, on 127.0.0.1:18443. Used by e2e.sh.
+services:
+  caddy:
+    environment:
+      SUBMARINE_DOMAIN: localhost
+    ports: !override
+      - "127.0.0.1:18443:443"
+    volumes:
+      - ./tests/docker/Caddyfile.test:/etc/caddy/Caddyfile:ro

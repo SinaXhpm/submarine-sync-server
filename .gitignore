@@ -1,0 +1,9 @@
+# Secrets and local settings (only at the top of the repository)
+/.env
+/config.php
+
+# Editors and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
