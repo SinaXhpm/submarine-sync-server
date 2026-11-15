@@ -102,6 +102,14 @@ if (($column('shared_profiles', 'share_id')['COLLATION_NAME'] ?? '') !== 'ascii_
     $db->exec('ALTER TABLE shared_profiles MODIFY share_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL');
     $changed[] = 'shared_profiles.share_id';
 }
+// 3. Account deletion finds the records a user wrote last into others' shares
+//    (and its update of them must use this index: src/lib/Account.php).
+$idx = $db->prepare('SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ?');
+$idx->execute([$name, 'shared_records', 'idx_writer']);
+if ((int) $idx->fetchColumn() === 0) {
+    $db->exec('ALTER TABLE shared_records ADD INDEX idx_writer (last_writer)');
+    $changed[] = 'shared_records.idx_writer';
+}
 
 $tables = $db->query('SHOW TABLES')->fetchAll(PDO::FETCH_COLUMN);
 echo "Database ready: $done statements run, " . count($tables) . ' tables'

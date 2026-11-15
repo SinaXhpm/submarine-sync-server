@@ -54,8 +54,16 @@ $pass = static function () use ($root): int {
         $run('old event log rows', 'DELETE FROM auth_events WHERE created_at < ?', [$now - (int) $l['audit_retain_seconds']]);
         // Failures that belong to no account (unknown tokens, codes, emails):
         // anyone can make those, so they are kept a shorter time.
-        $run('old failures of no account', 'DELETE FROM auth_events WHERE user_id IS NULL AND success = 0 AND created_at < ?',
-            [$now - (int) $l['audit_anon_retain_seconds']]);
+        // In batches of 5000, each its own statement, so a large backlog
+        // never holds its locks for long.
+        $anon = $db->prepare('DELETE FROM auth_events WHERE user_id IS NULL AND success = 0 AND created_at < ? LIMIT 5000');
+        $gone = 0;
+        for ($batch = 0; $batch < 200; $batch++) {
+            $anon->execute([$now - (int) $l['audit_anon_retain_seconds']]);
+            $gone += $anon->rowCount();
+            if ($anon->rowCount() < 5000) break;
+        }
+        $report[] = "old failures of no account: $gone";
         $run('old admin sessions', 'DELETE FROM admin_sessions WHERE seen_at < ?', [$now - 86400]);
     } catch (Throwable $e) {
         fwrite(STDERR, '[cron] ' . $e->getMessage() . "\n");

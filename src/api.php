@@ -692,6 +692,14 @@ try {
     if ($db->inTransaction()) {
         $db->rollBack();
     }
+    // A deadlock, a lock wait the database gave up on, or a row changed
+    // after the transaction's first read (1020, MariaDB's snapshot isolation):
+    // nothing was kept, and the same request can simply be sent again.
+    if ($e instanceof PDOException && in_array((int) ($e->errorInfo[1] ?? 0), [1020, 1205, 1213], true)) {
+        error_log('[submarine] busy: ' . $e->getMessage());
+        header('Retry-After: 1');
+        Util::sendError(503, 'busy', 'The server was busy; try again.');
+    }
     // The details go to the server log only.
     error_log('[submarine] ' . get_class($e) . ': ' . $e->getMessage() . ' @ ' . basename($e->getFile()) . ':' . $e->getLine());
     Util::sendError(500, 'internal', 'Internal server error');

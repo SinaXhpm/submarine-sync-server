@@ -104,7 +104,17 @@ $db->beginTransaction();
 // to different profiles can't both read the usage before either has written
 // and pass the caps together. (Every path that takes more locks takes this
 // one first; src/lib/Account.php does the same.)
-$db->prepare('SELECT id FROM users WHERE id = ? FOR UPDATE')->execute([$c['user_id']]);
+$lockMe = $db->prepare('SELECT id FROM users WHERE id = ? FOR UPDATE');
+$lockMe->execute([$c['user_id']]);
+if ($lockMe->fetchColumn() === false) {
+    // The account was deleted while this request waited: nothing of this
+    // exchange stays, the counter row made above included.
+    $db->rollBack();
+    $db->prepare('DELETE FROM sync_revs WHERE user_id = ? AND profile = ?
+                   AND NOT EXISTS (SELECT 1 FROM sync_records WHERE user_id = ? AND profile = ?)')
+       ->execute([$c['user_id'], $profile, $c['user_id'], $profile]);
+    Util::sendError(401, 'invalid_token', 'Unknown token');
+}
 // Under the lock, profiles with records only: pushes running at the same
 // moment have made their counter rows already, before their own transaction.
 if ($isNew && $heldOthers(false) >= $MAX_PROFILES) {

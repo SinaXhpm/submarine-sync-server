@@ -427,6 +427,68 @@ check('one owner row, and only that account is an owner member',
     [(int) one('SELECT COUNT(*) FROM profile_members WHERE share_id = ? AND role = "owner"', [$sidR]),
      (int) one('SELECT member_user_id FROM profile_members WHERE share_id = ? AND role = "owner"', [$sidR]) === $owner], [1, true]);
 
+section('an account deleted while its request waits for the account lock: 401, nothing left');
+/** Start a request without waiting for it; returns [multi handle, curl handle]. */
+function startRequest(string $path, array $body, string $tok): array
+{
+    $mh = curl_multi_init();
+    $ch = curl_init(BASE . $path);
+    curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 60,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'X-Auth-Token: ' . $tok], CURLOPT_POSTFIELDS => json_encode($body)]);
+    curl_multi_add_handle($mh, $ch);
+    $until = microtime(true) + 1.5;   // long enough to pass sign-in and reach the lock
+    do { curl_multi_exec($mh, $running); usleep(20000); } while ($running && microtime(true) < $until);
+    return [$mh, $ch];
+}
+function finishRequest(array $h): array
+{
+    [$mh, $ch] = $h;
+    do { curl_multi_exec($mh, $running); if ($running) curl_multi_select($mh, 1.0); } while ($running);
+    return [curl_getinfo($ch, CURLINFO_RESPONSE_CODE), json_decode((string) curl_multi_getcontent($ch), true)];
+}
+foreach (['/sync' => ['profile' => 'gone-profile', 'since' => '', 'records' => [rec('servers', $now)]],
+          '/shares/create' => ['share_id' => bin2hex(random_bytes(16)), 'name' => 'Gone', 'sealed_dek' => 'ab']] as $gpath => $gbody) {
+    $gone = mkuser('gone-' . bin2hex(random_bytes(3)) . '@stage.test');
+    $pdo->beginTransaction();
+    $pdo->prepare('SELECT id FROM users WHERE id = ? FOR UPDATE')->execute([$gone['id']]);
+    $h = startRequest($gpath, $gbody, $gone['tok']);
+    $pdo->prepare('DELETE FROM users WHERE id = ?')->execute([$gone['id']]);
+    $pdo->commit();
+    [$code, $json] = finishRequest($h);
+    check("$gpath: 401 invalid_token", [$code, $json['error'] ?? null], [401, 'invalid_token']);
+    check("$gpath: no counter, record or share row left", (int) one('SELECT
+        (SELECT COUNT(*) FROM sync_revs WHERE user_id = ?) + (SELECT COUNT(*) FROM sync_records WHERE user_id = ?)
+      + (SELECT COUNT(*) FROM shared_profiles WHERE owner_user_id = ?)', [$gone['id'], $gone['id'], $gone['id']]), 0);
+}
+
+section('a share deleted while a create waits for its row: 410, not made again');
+$dw = mkuser('share-gone@stage.test');
+$dwid = bin2hex(random_bytes(16));
+api($dw, 'POST', '/shares/create', ['share_id' => $dwid, 'name' => 'D', 'sealed_dek' => 'ab']);
+$pdo->beginTransaction();
+$pdo->prepare('SELECT owner_user_id FROM shared_profiles WHERE share_id = ? FOR UPDATE')->execute([$dwid]);
+$h = startRequest('/shares/create', ['share_id' => $dwid, 'name' => 'D2', 'sealed_dek' => 'ab'], $dw['tok']);
+foreach (['profile_members', 'shared_profiles'] as $t) {
+    $pdo->prepare("DELETE FROM `$t` WHERE share_id = ?")->execute([$dwid]);
+}
+$pdo->prepare('INSERT INTO deleted_shares (share_id, deleted_at) VALUES (?, ?)')->execute([$dwid, time()]);
+$pdo->commit();
+[$code, $json] = finishRequest($h);
+check('410 share_deleted', [$code, $json['error'] ?? null], [410, 'share_deleted']);
+check('the share stays deleted', (int) one('SELECT COUNT(*) FROM shared_profiles WHERE share_id = ?', [$dwid]), 0);
+
+section('/shares/sync takes a record\'s blob only as text');
+$sb = mkuser('share-blob@stage.test');
+$sbid = bin2hex(random_bytes(16));
+api($sb, 'POST', '/shares/create', ['share_id' => $sbid, 'name' => 'B', 'sealed_dek' => 'ab']);
+$badRec = rec('servers', $now);
+$badRec['blob'] = ['not', 'text'];
+$goodRec = rec('servers', $now + 1);
+$r = api($sb, 'POST', '/shares/sync', ['share_id' => $sbid, 'since' => '', 'records' => [$badRec, $goodRec]]);
+check('the push answers, the bad record is dropped', [$r['code'],
+    (int) one('SELECT COUNT(*) FROM shared_records WHERE share_id = ? AND uuid = ?', [$sbid, $badRec['uuid']]),
+    (int) one('SELECT COUNT(*) FROM shared_records WHERE share_id = ? AND uuid = ?', [$sbid, $goodRec['uuid']])], [200, 0, 1]);
+
 section('the profile cap counts the revision counters too');
 setConfig(['quota' => ['profiles' => 10]]);
 $u = mkuser('cap@stage.test');

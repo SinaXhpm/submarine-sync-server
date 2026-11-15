@@ -38,7 +38,15 @@ final class Account
             $owned = $db->prepare('SELECT share_id FROM shared_profiles WHERE owner_user_id = ?');
             $owned->execute([$uid]);
             $ownedIds = $owned->fetchAll(PDO::FETCH_COLUMN);
-            foreach ($ownedIds as $sid) {
+            // The counters of every share this touches: the ones it owns, and
+            // the ones whose records name it as their last writer (cleared
+            // below; idx_writer finds them). Locked in one sorted order, as a
+            // share's sync locks its counter before its records.
+            $w = $db->prepare('SELECT DISTINCT share_id FROM shared_records WHERE last_writer = ?');
+            $w->execute([$uid]);
+            $touched = array_values(array_unique(array_map('strval', array_merge($ownedIds, $w->fetchAll(PDO::FETCH_COLUMN)))));
+            sort($touched, SORT_STRING);
+            foreach ($touched as $sid) {
                 $db->prepare('SELECT rev FROM shared_revs WHERE share_id = ? FOR UPDATE')->execute([$sid]);
             }
             foreach ($ownedIds as $sid) {
@@ -50,7 +58,7 @@ final class Account
             }
             $db->prepare('DELETE FROM profile_members WHERE member_user_id = ?')->execute([$uid]);
             // The id could be given to someone else after a database restart.
-            $db->prepare('UPDATE shared_records SET last_writer = NULL WHERE last_writer = ?')->execute([$uid]);
+            $db->prepare('UPDATE shared_records FORCE INDEX (idx_writer) SET last_writer = NULL WHERE last_writer = ?')->execute([$uid]);
             foreach (['sync_records', 'sync_revs', 'sync_profiles', 'user_keys', 'auth_tokens', 'auth_events'] as $t) {
                 $db->prepare("DELETE FROM `$t` WHERE user_id = ?")->execute([$uid]);
             }

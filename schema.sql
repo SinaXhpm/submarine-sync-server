@@ -151,7 +151,8 @@ CREATE TABLE IF NOT EXISTS shared_records (
   rev         BIGINT UNSIGNED NOT NULL DEFAULT 0,
   PRIMARY KEY (share_id, uuid),
   KEY idx_since (share_id, updated_at),
-  KEY idx_rev (share_id, rev)
+  KEY idx_rev (share_id, rev),
+  KEY idx_writer (last_writer)
 ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin;
 
 CREATE TABLE IF NOT EXISTS shared_revs (

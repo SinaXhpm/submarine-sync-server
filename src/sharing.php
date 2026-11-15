@@ -218,17 +218,45 @@ if ($method === 'POST' && $path === '/shares/create') {
     if (!preg_match('/^[0-9a-f]+\z/', $sdek) || strlen($sdek) < 2 || strlen($sdek) > 100000) {
         \Submarine\Lib\Util::sendError(400, 'invalid_input', 'sealed_dek (hex) required');
     }
+    // Two tries: a deadlock (40001), or a row changed after this
+    // transaction's first read (1020: MariaDB's innodb_snapshot_isolation, on
+    // by default from 11.6; the share's deletion, for one), rolls everything
+    // back and is tried once more; a second one answers 503, never a 500.
+    for ($try = 1; ; $try++) {
+    try {
     $db->beginTransaction();
-    // One create at a time per account (the share cap below), and the share's
-    // row locked while ownership is decided.
-    $db->prepare('SELECT id FROM users WHERE id = ? FOR UPDATE')->execute([$c['user_id']]);
+    // One create at a time per account (the share cap below). Only the
+    // account's row is locked, never a share row that may not exist yet: a lock
+    // on a missing key is a gap lock, and two accounts holding one each
+    // deadlock as soon as both insert.
+    $lockMe = $db->prepare('SELECT id FROM users WHERE id = ? FOR UPDATE');
+    $lockMe->execute([$c['user_id']]);
+    if ($lockMe->fetchColumn() === false) {
+        // The account was deleted meanwhile.
+        $db->rollBack();
+        \Submarine\Lib\Util::sendError(401, 'invalid_token', 'Unknown token');
+    }
+    // A deleted id stays deleted. A plain read, without a lock: a locking
+    // read of an id that isn't there would be a gap lock again.
     if ($share_deleted($db, $sid)) {
         $db->rollBack();
         \Submarine\Lib\Util::sendError(410, 'share_deleted', 'This shared profile was deleted; share the profile again to get a new one.');
     }
-    $ex = $db->prepare('SELECT owner_user_id FROM shared_profiles WHERE share_id = ? FOR UPDATE');
+    $ex = $db->prepare('SELECT owner_user_id FROM shared_profiles WHERE share_id = ?');
     $ex->execute([$sid]);
     $owner = $ex->fetchColumn();
+    if ($owner !== false) {
+        // The share exists: its row is locked while ownership is decided. If
+        // its owner deleted it meanwhile (the deletion held the row), it is
+        // gone once the lock is ours.
+        $lk = $db->prepare('SELECT owner_user_id FROM shared_profiles WHERE share_id = ? FOR UPDATE');
+        $lk->execute([$sid]);
+        $owner = $lk->fetchColumn();
+        if ($owner === false) {
+            $db->rollBack();
+            \Submarine\Lib\Util::sendError(410, 'share_deleted', 'This shared profile was deleted; share the profile again to get a new one.');
+        }
+    }
     if ($owner !== false && (int) $owner !== (int) $c['user_id']) {
         $db->rollBack();
         \Submarine\Lib\Util::sendError(409, 'share_exists', 'share_id already taken');
@@ -252,7 +280,10 @@ if ($method === 'POST' && $path === '/shares/create') {
             $db->prepare('INSERT INTO shared_profiles (share_id, owner_user_id, name, created_at) VALUES (?, ?, ?, ?)')
                ->execute([$sid, $c['user_id'], $name, time()]);
         } catch (\PDOException $e) {
-            $db->rollBack();
+            // A deadlock has already ended the transaction on the server.
+            if ($db->inTransaction()) {
+                $db->rollBack();
+            }
             if ($e->getCode() !== '23000') throw $e;
             \Submarine\Lib\Util::sendError(409, 'share_exists', 'share_id already taken');
         }
@@ -266,6 +297,21 @@ if ($method === 'POST' && $path === '/shares/create') {
          ON DUPLICATE KEY UPDATE sealed_dek = VALUES(sealed_dek), role = "owner", status = "active"'
     )->execute([$sid, $c['user_id'], $sdek, $c['user_id'], time()]);
     $db->commit();
+    break;
+    } catch (\PDOException $e) {
+        if ($db->inTransaction()) {
+            $db->rollBack();
+        }
+        if ($e->getCode() !== '40001' && (int) ($e->errorInfo[1] ?? 0) !== 1020) {
+            throw $e;
+        }
+        if ($try >= 2) {
+            header('Retry-After: 1');
+            \Submarine\Lib\Util::sendError(503, 'busy', 'The server was busy; try again.');
+        }
+        usleep(random_int(20000, 80000));
+    }
+    }
     $audit->log($c['user_id'], $c['email'], $ip, 'share_create', true, "share=$sid");
     \Submarine\Lib\Util::sendJson(200, ['ok' => true, 'share_id' => $sid]);
 }
@@ -503,8 +549,8 @@ if ($method === 'POST' && $path === '/shares/sync') {
             continue;
         }
         $deleted = !empty($r['deleted']);
-        $blob = (array_key_exists('blob', $r) && $r['blob'] !== null) ? (string) $r['blob'] : null;
-        if ($blob !== null && (strlen($blob) > 2 * 1024 * 1024 || !preg_match('/^[0-9a-f]*\z/', $blob))) {
+        $blob = (array_key_exists('blob', $r) && $r['blob'] !== null) ? $r['blob'] : null;
+        if ($blob !== null && (!is_string($blob) || strlen($blob) > 2 * 1024 * 1024 || !preg_match('/^[0-9a-f]*\z/', $blob))) {
             continue;
         }
         $up->execute([

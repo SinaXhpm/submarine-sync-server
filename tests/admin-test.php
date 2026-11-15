@@ -236,8 +236,27 @@ $pid = mkpending('stale@stage.test');
 $pdo->prepare('UPDATE users SET created_at = NOW() - INTERVAL 8 DAY WHERE id = ?')->execute([$pid]);
 exec(escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg(ROOT . '/bin/cron.php') . ' 2>&1', $out, $rc);
 check('cron removes a sign-up never finished after a week', (int) one('SELECT COUNT(*) FROM users WHERE id = ?', [$pid]), 0);
+// A large backlog of anonymous failures goes in batches, all of it.
+$old = time() - 8 * 86400;
+$mark = '198.51.100.77';
+for ($i = 0; $i < 12; $i++) {
+    $pdo->exec('INSERT INTO auth_events (user_id, ip_address, event, success, created_at) VALUES '
+        . implode(',', array_fill(0, 1000, "(NULL, '$mark', 'login', 0, $old)")));
+}
+$pdo->prepare('INSERT INTO auth_events (user_id, ip_address, event, success, created_at) VALUES (NULL, ?, "login", 0, ?)')->execute([$mark, time()]);
+$pdo->prepare('INSERT INTO auth_events (user_id, ip_address, event, success, created_at) VALUES (?, ?, "login", 0, ?)')->execute([424242, $mark, $old]);
+$out = []; $rc = 0;
+exec(escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg(ROOT . '/bin/cron.php') . ' 2>&1', $out, $rc);
+preg_match('/old failures of no account: (\d+)/', implode("\n", $out), $m);
+check('cron clears 12000 old anonymous failures in batches', [$rc, (int) ($m[1] ?? -1)], [0, 12000]);
+check('a recent anonymous failure and an account\'s own stay', [
+    (int) one('SELECT COUNT(*) FROM auth_events WHERE ip_address = ? AND user_id IS NULL', [$mark]),
+    (int) one('SELECT COUNT(*) FROM auth_events WHERE ip_address = ? AND user_id IS NOT NULL', [$mark])], [1, 1]);
+$pdo->prepare('DELETE FROM auth_events WHERE ip_address = ?')->execute([$mark]);
 $out = []; $rc = 0;
 exec(escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg(ROOT . '/bin/migrate.php') . ' 2>&1', $out, $rc);
 check('migrate runs again without harm', [$rc, str_contains(implode("\n", $out), 'Database ready')], [0, true]);
+check('shared_records has idx_writer (account deletion looks records up by their last writer)', (int) one(
+    'SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = "shared_records" AND INDEX_NAME = "idx_writer"'), 1);
 
 done();
