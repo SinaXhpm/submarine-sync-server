@@ -1,0 +1,622 @@
+#!/usr/bin/env bash
+# Submarine sync server — manage a server installed with Docker Compose.
+#
+#   submarine-sync help
+#
+# install.sh links this file to /usr/local/bin/submarine-sync. It works on the
+# folder it is in (docker-compose.yml, .env), or on SUBMARINE_DIR. Run it as
+# root (or as a member of the docker group): it drives Docker.
+
+set -euo pipefail
+# The usual umask, so files git writes on an update stay readable. Private
+# files get their modes where they are made (.env, backups).
+umask 022
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+DIR=$(readlink -f "${SUBMARINE_DIR:-$(dirname "$SELF")}")
+LOCK=/run/lock/submarine-sync.lock
+[ -d /run/lock ] || LOCK=/tmp/submarine-sync.lock
+BACKUP_MADE=
+
+# Temporary files and folders go when the command ends, however it ends.
+TMPS=()
+cleanup() { local p; for p in ${TMPS[@]+"${TMPS[@]}"}; do rm -rf -- "$p"; done; }
+trap cleanup EXIT
+
+if [ -t 1 ]; then B=$'\033[1m'; Y=$'\033[33m'; R=$'\033[31m'; N=$'\033[0m'; else B=; Y=; R=; N=; fi
+say()  { printf '%s==> %s%s\n' "$B" "$*" "$N"; }
+info() { printf '    %s\n' "$*"; }
+warn() { printf '%s!!  %s%s\n' "$Y" "$*" "$N" >&2; }
+die()  { printf '%sError: %s%s\n' "$R" "$*" "$N" >&2; exit 1; }
+
+usage() {
+    cat <<'TXT'
+Usage: submarine-sync <command> [arguments]
+
+The server
+  status               What runs, the address, HTTPS, the last backup.
+  start | stop         Start or stop every part of the server.
+  restart              Start again, with the settings in .env.
+  logs [part]          Follow the logs (app, db, cron, caddy). Ctrl+C ends it.
+  update [version]     Back up, then move to the newest release (or the one
+                       named) and restart. Goes back if the new one fails.
+  version              The version that runs.
+
+Accounts (the same as php bin/admin.php in the app container)
+  invite <email>       A code to make an account in the app.
+  reset-code <email>   A code to choose a new password in the app.
+  list [text]          Accounts, newest first.
+  suspend <email>      Stop an account and sign it out everywhere.
+  unsuspend <email>    Let it sign in again.
+  signout <email>      Sign an account out on every device.
+  delete <email>       Delete an account and everything it holds.
+  check                Check the settings and the database.
+
+Settings
+  set NAME=VALUE ...   Change settings in .env; then run: submarine-sync restart
+  edit                 Open .env in an editor, then restart.
+  admin-password       Switch on the web admin panel, or give it a new
+                       password (--generate: make one; --off: switch it off).
+
+Backups (the database and .env, in SUBMARINE_BACKUP_DIR)
+  backup [--keep N]    Make one now; keep the newest N (default 14).
+  backups              List them.
+  restore <file>       Put the database of a backup back (asks first).
+
+  uninstall [--purge]  Stop and remove the containers; --purge also removes
+                       the data and this folder (after a last backup).
+TXT
+}
+
+cd "$DIR" 2>/dev/null || die "There is no folder $DIR."
+[ -f docker-compose.yml ] || die "$DIR has no docker-compose.yml: set SUBMARINE_DIR to the server's folder."
+
+# --- .env -------------------------------------------------------------------
+
+# A value as written in a .env file, without its quotes.
+unquote() {
+    local v=${1%$'\r'}
+    case "$v" in
+        \'*\') v=${v#\'}; v=${v%\'} ;;
+        \"*\") v=${v#\"}; v=${v%\"} ;;
+    esac
+    printf '%s' "$v"
+}
+
+# The value of a setting in .env, without its quotes ('' when it isn't there).
+env_get() {
+    [ -f .env ] || return 0
+    unquote "$(sed -n "s/^$1=//p" .env | sed -n '$p')"
+}
+
+# A value as .env needs it: plain when it is plain, else in single quotes
+# (Compose reads nothing inside those, not even a $).
+env_quote() {
+    local v=$1
+    if [[ $v =~ ^[A-Za-z0-9_./:@,+=-]*$ ]]; then
+        printf '%s' "$v"
+    elif [[ $v != *"'"* ]]; then
+        printf "'%s'" "$v"
+    else
+        die "A value with a single quote in it can't be written here; edit .env by hand (submarine-sync edit)."
+    fi
+}
+
+# Write NAME=VALUE into .env (VALUE as given), replacing the line that is
+# there or adding one. The file is replaced in one step and stays private.
+env_set() {
+    local k=$1 v=$2 tmp
+    [[ $k =~ ^[A-Z][A-Z0-9_]*$ ]] || die "$k is not a setting name."
+    [[ $v != *$'\n'* && $v != *$'\r'* ]] || die "A value can't have a line break."
+    [ -f .env ] || die "There is no .env in $DIR (run ./setup.sh first)."
+    tmp=$(mktemp "$DIR/.env.XXXXXX")
+    K=$k V=$v awk 'BEGIN { k = ENVIRON["K"]; v = ENVIRON["V"]; done = 0 }
+        index($0, k "=") == 1 { if (!done) print k "=" v; done = 1; next }
+        { print }
+        END { if (!done) print k "=" v }' .env > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" .env
+}
+
+backup_dir() { local d; d=$(env_get SUBMARINE_BACKUP_DIR); printf '%s' "${d:-/var/backups/submarine-sync}"; }
+https_on()   { [[ ,$(env_get COMPOSE_PROFILES), == *,https,* ]] && [ -n "$(env_get SUBMARINE_DOMAIN)" ]; }
+local_port() { local p; p=$(env_get SUBMARINE_HTTP_PORT); printf '%s' "${p:-8080}"; }
+address()    {
+    local base; base=$(env_get SUBMARINE_BASE_PATH); base=${base%/}
+    if https_on; then printf 'https://%s%s' "$(env_get SUBMARINE_DOMAIN)" "$base"
+    else printf 'http://127.0.0.1:%s%s' "$(local_port)" "$base"; fi
+}
+
+# --- Docker -----------------------------------------------------------------
+
+need_docker() {
+    command -v docker >/dev/null 2>&1 || die "Docker is not installed (install.sh installs it)."
+    docker compose version >/dev/null 2>&1 || die "Docker Compose (docker compose) is not installed."
+    docker info >/dev/null 2>&1 || die "Docker isn't running, or this user may not use it (run as root: sudo submarine-sync ...)."
+}
+dc() { docker compose "$@"; }
+
+# exec into a container; with a terminal when this command has one.
+dc_exec() {
+    if [ -t 0 ] && [ -t 1 ]; then dc exec "$@"; else dc exec -T "$@"; fi
+}
+
+# Health of a service's container: healthy, starting, unhealthy, running,
+# exited ... or missing.
+state_of() {
+    local id
+    id=$(dc ps -q "$1" 2>/dev/null || true)
+    [ -n "$id" ] || { echo missing; return 0; }
+    docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$id" 2>/dev/null || echo missing
+}
+
+# Wait for the app to be healthy (it runs migrate.php first). $1: seconds.
+# Gives up at once when the app turned unhealthy, or stopped and was started
+# again (wrong settings stop it at every start).
+wait_healthy() {
+    local until=$(( $(date +%s) + ${1:-180} )) st id restarts
+    while [ "$(date +%s)" -lt "$until" ]; do
+        st=$(state_of app)
+        [ "$st" = healthy ] && return 0
+        [ "$st" = unhealthy ] && return 1
+        id=$(dc ps -q app 2>/dev/null || true)
+        if [ -n "$id" ]; then
+            restarts=$(docker inspect -f '{{.RestartCount}}' "$id" 2>/dev/null || echo 0)
+            [ "${restarts:-0}" -gt 0 ] && return 1
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+# Whether https://<domain>/health answers through Caddy on this machine, with
+# a certificate this machine trusts (not for "localhost": Caddy's own CA).
+https_answers() {
+    local d=$1 k=()
+    [ "$d" = localhost ] && k=(-k)
+    curl -fsS ${k[@]+"${k[@]}"} --max-time 8 -o /dev/null --resolve "$d:443:127.0.0.1" "https://$d$(env_get SUBMARINE_BASE_PATH)/health" 2>/dev/null
+}
+
+# Wait for HTTPS. Returns 3 when it doesn't come, after saying why it may not.
+wait_https() {
+    local d
+    https_on || return 0
+    d=$(env_get SUBMARINE_DOMAIN)
+    info "Waiting for the HTTPS certificate of $d (up to 3 minutes)..."
+    for _ in $(seq 1 36); do
+        if https_answers "$d"; then
+            info "HTTPS works: $(address)"
+            return 0
+        fi
+        sleep 5
+    done
+    warn "HTTPS for $d doesn't answer yet. Caddy's last lines:"
+    dc logs --no-color --tail=15 caddy >&2 || true
+    warn "Check that the DNS record of $d points at this server, and that ports 80 and 443"
+    warn "are open (also in your provider's firewall). Caddy keeps trying; see: submarine-sync status"
+    return 3
+}
+
+version_name() { git -c safe.directory="$DIR" -C "$DIR" describe --tags --always --dirty 2>/dev/null || echo unknown; }
+g() { git -c safe.directory="$DIR" -C "$DIR" "$@"; }
+
+# Newest release tag (vX.Y.Z only, no pre-releases), or nothing.
+newest_release() { g tag -l 'v[0-9]*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed -n 1p || true; }
+
+# One mutating command at a time (a backup from the timer during an update...).
+take_lock() {
+    exec 9>"$LOCK"
+    flock -n 9 || die "Another submarine-sync command is running; try again when it is done."
+}
+
+# Whether there is a terminal to ask on (/dev/tty can exist and still not open).
+have_tty() { (exec < /dev/tty) 2>/dev/null; }
+
+confirm() {  # $1: question, $2: the word to type
+    local a=''
+    have_tty || die "Add --yes to go on without a question (there is no terminal to ask on)."
+    printf '%s Type %s to go on: ' "$1" "$2" > /dev/tty
+    read -r a < /dev/tty || true
+    [ "$a" = "$2" ] || die "Stopped; nothing changed."
+}
+
+# --- Commands -----------------------------------------------------------------
+
+cmd_status() {
+    need_docker
+    local d st
+    echo "Version:  $(version_name)"
+    echo "Folder:   $DIR"
+    echo "Address:  $(address)$(https_on || printf ' (this machine only)')"
+    echo
+    dc ps --all --format 'table {{.Service}}\t{{.State}}\t{{.Status}}' 2>/dev/null || dc ps --all
+    echo
+    if curl -fsS --max-time 5 -o /dev/null "http://127.0.0.1:$(local_port)$(env_get SUBMARINE_BASE_PATH)/health" 2>/dev/null; then
+        echo "Server:   answers on 127.0.0.1:$(local_port)"
+    else
+        echo "Server:   NO ANSWER on 127.0.0.1:$(local_port) (submarine-sync logs app)"
+    fi
+    if https_on; then
+        d=$(env_get SUBMARINE_DOMAIN)
+        if https_answers "$d"; then
+            local end=''
+            if command -v openssl >/dev/null 2>&1; then
+                end=$(echo | timeout 10 openssl s_client -connect 127.0.0.1:443 -servername "$d" 2>/dev/null \
+                    | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2 || true)
+            fi
+            echo "HTTPS:    works${end:+, certificate valid until $end}"
+        else
+            echo "HTTPS:    NOT WORKING for $d (submarine-sync logs caddy)"
+        fi
+    fi
+    local bdir newest
+    bdir=$(backup_dir)
+    newest=$(ls -1t "$bdir"/submarine-sync-*.tar.gz 2>/dev/null | sed -n 1p || true)
+    if [ -n "$newest" ]; then
+        echo "Backup:   $(date -r "$newest" '+%Y-%m-%d %H:%M') $newest"
+    else
+        echo "Backup:   none yet in $bdir (submarine-sync backup)"
+    fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet submarine-sync-backup.timer 2>/dev/null; then
+        echo "          daily backup on, next: $(systemctl show -p NextElapseUSecRealtime --value submarine-sync-backup.timer 2>/dev/null || echo '?')"
+    fi
+    timeout 10 git -c safe.directory="$DIR" -C "$DIR" fetch --quiet --tags origin >/dev/null 2>&1 || true
+    st=$(newest_release)
+    if [ -n "$st" ] && ! g merge-base --is-ancestor "$st" HEAD 2>/dev/null; then
+        echo
+        echo "Release $st is out (you run $(version_name)): submarine-sync update"
+    fi
+}
+
+cmd_start() {
+    need_docker
+    say "Starting the server"
+    dc up -d --remove-orphans
+    wait_healthy 240 || { dc logs --no-color --tail=40 app db >&2 || true; die "The server didn't come up; the lines above say why."; }
+    info "The server is up: $(address)"
+    wait_https
+}
+
+cmd_stop() { need_docker; dc stop; }
+
+cmd_restart() {
+    need_docker
+    say "Restarting with the settings in .env"
+    dc up -d --force-recreate --remove-orphans
+    wait_healthy 240 || { dc logs --no-color --tail=40 app >&2 || true; die "The server didn't come up again; the lines above say why."; }
+    info "The server is up: $(address)"
+    wait_https
+}
+
+cmd_logs() { need_docker; dc logs -f --tail=100 "$@"; }
+
+cmd_admin() {  # bin/admin.php in the app container
+    need_docker
+    local st; st=$(state_of app)
+    if [ "$1" = check ] && [ "$st" != healthy ]; then
+        # A server that can't start (wrong settings) is when check is needed
+        # most: it runs in a container of its own then.
+        dc run --rm -T --no-deps app php bin/admin.php check
+        return
+    fi
+    case "$st" in
+        healthy|unhealthy|starting) dc_exec app php bin/admin.php "$@" ;;
+        *) die "The server isn't running (submarine-sync start; submarine-sync check says what is wrong)." ;;
+    esac
+}
+
+cmd_set() {
+    [ $# -gt 0 ] || die "Say what to set, for example: submarine-sync set SUBMARINE_SIGNUP=open"
+    local a k v
+    for a in "$@"; do
+        [[ $a == *=* ]] || die "Write it as NAME=VALUE: $a"
+        k=${a%%=*}; v=${a#*=}
+        case "$k" in
+            SUBMARINE_DB_PASSWORD|MARIADB_ROOT_PASSWORD)
+                die "$k is only read when the database is made; changing it here would lock the server out of its database." ;;
+            SUBMARINE_TOKEN_PEPPER)
+                warn "A new token pepper signs every device out." ;;
+        esac
+        env_set "$k" "$(env_quote "$v")"
+        info "$k set."
+    done
+    info "Run submarine-sync restart to use the new settings."
+}
+
+cmd_edit() {
+    local ed=${VISUAL:-${EDITOR:-}} a
+    if [ -z "$ed" ]; then
+        for ed in nano vim vi; do command -v "$ed" >/dev/null 2>&1 && break; done
+    fi
+    "$ed" .env
+    chmod 600 .env
+    printf 'Restart now with these settings? [Y/n] '
+    read -r a || a=n
+    case "$a" in n|N|no) info "Not restarted. Later: submarine-sync restart" ;; *) cmd_restart ;; esac
+}
+
+cmd_admin_password() {
+    need_docker
+    local gen=0 off=0 path='' pw pw2 hash shown=''
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --generate) gen=1 ;;
+            --off) off=1 ;;
+            --path) path=${2:-}; shift ;;
+            --path=*) path=${1#*=} ;;
+            *) die "Unknown option: $1" ;;
+        esac
+        shift
+    done
+    if [ $off = 1 ]; then
+        env_set SUBMARINE_ADMIN_PASSWORD_HASH ''
+        dc up -d app >/dev/null
+        wait_healthy || die "The server didn't come up again (submarine-sync logs app)."
+        info "The web admin panel is off."
+        return 0
+    fi
+    if [ $gen = 1 ] || ! have_tty; then
+        pw=$(head -c 18 /dev/urandom | base64 | tr -d '/+=\n')
+        shown=$pw
+    else
+        printf 'New admin password (12 characters or more): ' > /dev/tty
+        read -rs pw < /dev/tty; printf '\n' > /dev/tty
+        printf 'Again: ' > /dev/tty
+        read -rs pw2 < /dev/tty; printf '\n' > /dev/tty
+        [ "$pw" = "$pw2" ] || die "The two don't match."
+    fi
+    [ ${#pw} -ge 12 ] || die "The password needs 12 characters or more."
+    # The password goes to PHP on its standard input, never on a command line.
+    hash=$(printf '%s' "$pw" | dc run --rm -T --no-deps app php -r 'echo password_hash(stream_get_contents(STDIN), PASSWORD_DEFAULT);')
+    [[ $hash =~ ^\$2y\$[0-9]{2}\$[./A-Za-z0-9]{53}$ ]] || die "Making the password hash failed."
+    env_set SUBMARINE_ADMIN_PASSWORD_HASH "'$hash'"
+    # A path nobody guesses keeps password guessers (and the panel's sign-in
+    # lock they would set off) away.
+    [ -n "$path" ] || path=$(env_get SUBMARINE_ADMIN_PATH)
+    if [ -z "$path" ] || [ "$path" = /admin ]; then
+        path="/admin-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    fi
+    [[ $path =~ ^(/[A-Za-z0-9._~-]+)+$ ]] || die "The panel's path must look like /admin-panel (letters, digits, - _ . ~)."
+    env_set SUBMARINE_ADMIN_PATH "$path"
+    dc up -d app >/dev/null
+    wait_healthy || die "The server didn't come up again (submarine-sync logs app)."
+    say "The web admin panel is on"
+    if https_on; then
+        info "Address:  $(address)$path"
+    else
+        info "Address:  http://127.0.0.1:$(local_port)$(env_get SUBMARINE_BASE_PATH)$path"
+        info "It needs HTTPS. For a browser on this machine (or through an SSH tunnel):"
+        info "submarine-sync set SUBMARINE_ADMIN_ALLOW_HTTP_LOCAL=1, then submarine-sync restart"
+    fi
+    if [ -n "$shown" ]; then
+        info "Password: $shown"
+        info "(shown only now; a new one: submarine-sync admin-password)"
+    fi
+}
+
+cmd_backup() {
+    need_docker
+    local keep='' quiet=0 tag='' bdir tmp ts name
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --keep) keep=${2:-}; shift ;;
+            --keep=*) keep=${1#*=} ;;
+            --quiet) quiet=1 ;;
+            --tag) tag=${2:-}; shift ;;
+            *) die "Unknown option: $1" ;;
+        esac
+        shift
+    done
+    [ -n "$keep" ] || keep=$(env_get SUBMARINE_BACKUP_KEEP)
+    keep=${keep:-14}
+    [[ $keep =~ ^[0-9]+$ ]] && [ "$keep" -ge 1 ] || die "--keep needs a number, 1 or more."
+    [[ $tag =~ ^[a-z0-9-]*$ ]] || die "Bad tag."
+    case "$(state_of db)" in healthy|running) ;; *) die "The database isn't running (submarine-sync start)." ;; esac
+    bdir=$(backup_dir)
+    # Everything of a backup is private from the first byte (it holds .env).
+    local um; um=$(umask)
+    umask 077
+    install -d -m 700 "$bdir"
+    ts=$(date -u +%Y%m%d-%H%M%S)
+    name="submarine-sync-$ts${tag:+-$tag}.tar.gz"
+    tmp=$(mktemp -d "$bdir/.part-XXXXXX")
+    TMPS+=("$tmp" "$bdir/.$name")
+    # One consistent snapshot without locking the tables (all are InnoDB).
+    # The password is read inside the container, never from a command line.
+    dc exec -T db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" exec mariadb-dump -uroot --single-transaction --quick --skip-lock-tables --default-character-set=utf8mb4 submarine' > "$tmp/db.sql" \
+        || die "The database dump failed."
+    [ "$(tail -n 1 "$tmp/db.sql" | cut -c1-17)" = '-- Dump completed' ] || die "The database dump is incomplete."
+    cp .env "$tmp/env"
+    printf 'version=%s\ncreated=%s\n' "$(version_name)" "$ts" > "$tmp/info"
+    tar -C "$tmp" -czf "$bdir/.$name" db.sql env info
+    chmod 600 "$bdir/.$name"
+    mv "$bdir/.$name" "$bdir/$name"
+    rm -rf -- "$tmp"
+    umask "$um"
+    # Keep the newest $keep.
+    { ls -1t "$bdir"/submarine-sync-*.tar.gz 2>/dev/null || true; } | tail -n +"$((keep + 1))" | while IFS= read -r old; do rm -f -- "$old"; done
+    [ $quiet = 1 ] || info "Backup: $bdir/$name ($(du -h "$bdir/$name" | cut -f1)). It holds .env's secrets: keep copies private."
+    BACKUP_MADE="$bdir/$name"
+}
+
+cmd_backups() {
+    local bdir; bdir=$(backup_dir)
+    if ! ls "$bdir"/submarine-sync-*.tar.gz >/dev/null 2>&1; then
+        info "No backups in $bdir."
+        return 0
+    fi
+    ls -1t "$bdir"/submarine-sync-*.tar.gz | while IFS= read -r f; do
+        printf '%s  %6s  %s\n' "$(date -r "$f" '+%Y-%m-%d %H:%M')" "$(du -h "$f" | cut -f1)" "$f"
+    done
+}
+
+cmd_restore() {
+    need_docker
+    local file='' yes=0 tmp pep cur ver
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --yes) yes=1 ;;
+            -*) die "Unknown option: $1" ;;
+            *) file=$1 ;;
+        esac
+        shift
+    done
+    [ -n "$file" ] || die "Say which backup: submarine-sync restore <file> (submarine-sync backups lists them)."
+    [ -f "$file" ] || die "There is no file $file."
+    file=$(readlink -f "$file")
+    local list
+    list=$(tar -tzf "$file" 2>/dev/null) || die "$file is not a backup of this server."
+    [[ $'\n'$list$'\n' == *$'\n'db.sql$'\n'* ]] || die "$file is not a backup of this server."
+    tmp=$(mktemp -d)
+    TMPS+=("$tmp")
+    tar -C "$tmp" -xzf "$file" db.sql
+    [ "$(tail -n 1 "$tmp/db.sql" | cut -c1-17)" = '-- Dump completed' ] || die "The database dump in $file is incomplete."
+    ver=$(tar -xzOf "$file" info 2>/dev/null | sed -n 's/^version=//p' || true)
+    [ $yes = 1 ] || confirm "This replaces the server's database with the one in $file${ver:+ (made by $ver)}. Everything since then is lost." restore
+    take_lock
+    case "$(state_of db)" in healthy|running) ;; *) dc up -d db; sleep 5 ;; esac
+    say "A backup of the database as it is now, first"
+    cmd_backup --tag before-restore
+    local safety=$BACKUP_MADE
+    say "Restoring $file"
+    dc stop app cron >/dev/null 2>&1 || true
+    if ! dc exec -T db sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" exec mariadb -uroot submarine' < "$tmp/db.sql"; then
+        dc up -d >/dev/null 2>&1 || true
+        die "The restore failed. The database as it was is in $safety (submarine-sync restore $safety)."
+    fi
+    # Sign-ins and codes in that database are only good with the token pepper
+    # they were made with.
+    pep=$(unquote "$(tar -xzOf "$file" env 2>/dev/null | sed -n 's/^SUBMARINE_TOKEN_PEPPER=//p' | sed -n '$p' || true)")
+    cur=$(env_get SUBMARINE_TOKEN_PEPPER)
+    if [ -n "$pep" ] && [ "$pep" != "$cur" ]; then
+        env_set SUBMARINE_TOKEN_PEPPER "$(env_quote "$pep")"
+        info "The token pepper of the backup is back in .env too, so its sign-ins keep working."
+    fi
+    dc up -d --remove-orphans
+    wait_healthy 240 || die "The server didn't come up after the restore (submarine-sync logs app). The old database is in $safety."
+    info "Restored. The database from before is in $safety."
+}
+
+cmd_update() {
+    need_docker
+    local target='' yes=0 cur cur_name new
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --yes) yes=1 ;;
+            -*) die "Unknown option: $1" ;;
+            *) target=$1 ;;
+        esac
+        shift
+    done
+    take_lock
+    say "Looking for a new version"
+    g fetch --quiet --tags --force origin || die "Couldn't reach $(g remote get-url origin 2>/dev/null || echo the repository)."
+    cur=$(g rev-parse HEAD)
+    cur_name=$(version_name)
+    if [ -z "$target" ]; then
+        target=$(newest_release)
+        # Without releases, the main branch.
+        [ -n "$target" ] || target=origin/main
+    fi
+    # A release tag, else a branch as it is on the server (not a stale local copy).
+    new=$(g rev-parse --verify --quiet "refs/tags/$target^{commit}" || g rev-parse --verify --quiet "origin/$target^{commit}" \
+        || g rev-parse --verify --quiet "$target^{commit}") || die "There is no release or branch $target."
+    if [ "$new" = "$cur" ]; then
+        info "Already up to date ($cur_name)."
+        return 0
+    fi
+    [ -z "$(g status --porcelain --untracked-files=no)" ] \
+        || die "Files in $DIR were changed by hand (git status lists them); undo that first."
+    if g merge-base --is-ancestor "$new" "$cur"; then
+        [ $yes = 1 ] || confirm "$target is OLDER than what runs ($cur_name)." older
+    fi
+    say "Updating $cur_name to $target"
+    cmd_backup --tag before-update
+    local safety=$BACKUP_MADE
+    g checkout --quiet --detach "$new"
+    # --pull: the base images' newest builds (security fixes) for the same
+    # pinned versions; without it when Docker Hub can't be reached.
+    dc pull --quiet db >/dev/null 2>&1 || true
+    if https_on; then dc pull --quiet caddy >/dev/null 2>&1 || true; fi
+    if ! { { dc build --pull app || dc build app; } && dc up -d --remove-orphans && wait_healthy 240; }; then
+        warn "The new version didn't start. Going back to $cur_name."
+        dc logs --no-color --tail=30 app >&2 || true
+        g checkout --quiet --detach "$cur"
+        dc build app && dc up -d --remove-orphans && wait_healthy 240 \
+            && die "Back on $cur_name; the update didn't happen. A backup from before it: $safety" \
+            || die "The old version didn't start again either. The backup from before the update: $safety (submarine-sync restore)."
+    fi
+    # The image the update replaced (only this server's, by its label).
+    docker image prune -f --filter "label=org.opencontainers.image.source=https://github.com/SinaXhpm/submarine-sync-server" >/dev/null 2>&1 || true
+    info "Now on $(version_name). The backup from before: $safety"
+    wait_https || true
+}
+
+cmd_uninstall() {
+    need_docker
+    local purge=0 yes=0 bdir
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --purge) purge=1 ;;
+            --yes) yes=1 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+        shift
+    done
+    take_lock
+    bdir=$(backup_dir)
+    case "$DIR" in /|/root|/home|/opt|/usr|/usr/local|/var|/etc|/srv) die "Refusing to remove $DIR." ;; esac
+    if [ $purge = 0 ]; then
+        [ $yes = 1 ] || confirm "This stops the server and removes its containers. The data and $DIR stay." stop
+        dc down --remove-orphans
+        timer_off
+        info "Stopped. The data is kept: submarine-sync start brings it back; submarine-sync uninstall --purge removes all."
+        return 0
+    fi
+    [ $yes = 1 ] || confirm "This deletes the server's database, its settings and $DIR from this machine. A last backup goes to $bdir first." DELETE
+    case "$(state_of db)" in healthy|running) cmd_backup --tag before-uninstall ;; *) warn "The database isn't running: no last backup." ;; esac
+    dc --profile https down --volumes --remove-orphans --rmi local
+    timer_off
+    if [ "$(readlink -f /usr/local/bin/submarine-sync 2>/dev/null || true)" = "$SELF" ]; then rm -f /usr/local/bin/submarine-sync; fi
+    cd /
+    rm -rf -- "$DIR"
+    info "Removed. Backups stay in $bdir; Docker itself stays installed."
+}
+
+timer_off() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    if [ -f /etc/systemd/system/submarine-sync-backup.timer ]; then
+        systemctl disable --now submarine-sync-backup.timer >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/submarine-sync-backup.timer /etc/systemd/system/submarine-sync-backup.service
+        systemctl daemon-reload || true
+        info "The daily backup is off."
+    fi
+}
+
+main() {
+    local cmd=${1:-help}
+    [ $# -gt 0 ] && shift
+    case "$cmd" in
+        help|-h|--help) usage ;;
+        status) cmd_status ;;
+        start) cmd_start ;;
+        stop) cmd_stop ;;
+        restart) cmd_restart ;;
+        logs) cmd_logs "$@" ;;
+        update) cmd_update "$@" ;;
+        version|--version) version_name ;;
+        invite|reset-code|list|suspend|unsuspend|signout|delete|check) cmd_admin "$cmd" "$@" ;;
+        set) cmd_set "$@" ;;
+        edit) cmd_edit ;;
+        admin-password) cmd_admin_password "$@" ;;
+        backup) take_lock; cmd_backup "$@" ;;
+        backups) cmd_backups ;;
+        restore) cmd_restore "$@" ;;
+        uninstall) cmd_uninstall "$@" ;;
+        *) usage >&2; die "Unknown command: $cmd" ;;
+    esac
+}
+
+# On one line: bash has read all of it before it runs, so an update that
+# replaces this file while it runs can't change what runs.
+main "$@"; exit $?

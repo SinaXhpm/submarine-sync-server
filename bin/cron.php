@@ -65,6 +65,18 @@ $pass = static function () use ($root): int {
         }
         $report[] = "old failures of no account: $gone";
         $run('old admin sessions', 'DELETE FROM admin_sessions WHERE seen_at < ?', [$now - 86400]);
+        // Rows that outlived their share: a deleted share's id can never be
+        // used again, so a record, counter or membership that still names one
+        // (a push or an invitation that crossed the deletion) is of no use to
+        // anyone. The join starts from deleted_shares and finds the rows by
+        // their primary key, so this doesn't read the record tables through.
+        $left = 0;
+        foreach (['shared_records', 'shared_revs', 'profile_members'] as $t) {
+            $st = $db->prepare("DELETE t FROM `$t` t JOIN deleted_shares d ON d.share_id = t.share_id");
+            $st->execute();
+            $left += $st->rowCount();
+        }
+        $report[] = "rows of deleted shares: $left";
     } catch (Throwable $e) {
         fwrite(STDERR, '[cron] ' . $e->getMessage() . "\n");
         return 1;

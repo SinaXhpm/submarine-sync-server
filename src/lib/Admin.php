@@ -121,11 +121,17 @@ final class Admin
         return ['code' => $code, 'ttl' => $ttl, 'email' => $email];
     }
 
+    /**
+     * Stops the account: its sign-ins end, and its unused codes (invitation,
+     * reset, sign-in) are cancelled, so none of them works again after an
+     * unsuspend. Make a new code then if one is needed.
+     */
     public function suspend(int $uid): void
     {
         $u = $this->mustExist($uid);
         $this->db->prepare('UPDATE users SET status = "banned" WHERE id = ?')->execute([$uid]);
         $this->db->prepare('DELETE FROM auth_tokens WHERE user_id = ?')->execute([$uid]);
+        $this->db->prepare('DELETE FROM verify_tokens WHERE user_id = ?')->execute([$uid]);
         $this->audit->log($uid, $u['email'], $this->actorIp, 'admin_suspend', true);
     }
 
@@ -143,10 +149,15 @@ final class Admin
         $this->audit->log($uid, $u['email'], $this->actorIp, 'admin_unsuspend', true);
     }
 
-    /** Signs the account out on every device; returns how many sign-ins ended. */
+    /**
+     * Signs the account out on every device, and cancels its unused reset and
+     * sign-in codes (each would make a new sign-in). Returns how many
+     * sign-ins ended.
+     */
     public function signOut(int $uid): int
     {
         $u = $this->mustExist($uid);
+        $this->db->prepare('DELETE FROM verify_tokens WHERE user_id = ? AND purpose IN ("reset", "login")')->execute([$uid]);
         $st = $this->db->prepare('DELETE FROM auth_tokens WHERE user_id = ?');
         $st->execute([$uid]);
         $this->audit->log($uid, $u['email'], $this->actorIp, 'admin_signout', true, 'tokens=' . $st->rowCount());

@@ -1,0 +1,14 @@
+# Submarine sync server — a backup every day at a quiet hour. The newest 14
+# are kept (SUBMARINE_BACKUP_KEEP in .env). A day the machine was off is made
+# up for when it starts (Persistent).
+
+[Unit]
+Description=Daily Submarine sync server backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=45min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

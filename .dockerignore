@@ -9,4 +9,7 @@ tests
 docker-compose.yml
 Caddyfile
 setup.sh
+install.sh
+submarine-sync
+deploy
 *.md

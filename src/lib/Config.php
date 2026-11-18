@@ -35,8 +35,9 @@ final class Config
             // Who may make an account: 'invite' (the admin makes a code, no mail
             // needed) or 'open' (anyone, with a code sent by mail).
             'signup'       => 'invite',
-            // Most accounts the server holds (0: no limit). Counts every account,
-            // pending ones too.
+            // Most accounts sign-up may make (0: no limit). Counts finished
+            // accounts (active and suspended), not sign-ups nobody finished;
+            // an admin's invitation is never held back by it.
             'max_accounts' => 0,
             // The server's address when it is not at the root of its host name,
             // for example '/submarine'. Empty at the root.

@@ -25,6 +25,7 @@ require $root . '/src/lib/Bootstrap.php';
 
 use Submarine\Lib\Admin;
 use Submarine\Lib\Audit;
+use Submarine\Lib\Auth;
 use Submarine\Lib\Bootstrap;
 use Submarine\Lib\Config;
 
@@ -39,6 +40,8 @@ $args = array_values(array_filter($args, function ($a) use (&$yes) {
 }));
 
 function out(string $s = ''): void { echo $s, "\n"; }
+/** Text from the database, safe to print: no control characters for the terminal to run. */
+function clean(string $s): string { return (string) preg_replace('/[\x00-\x1f\x7f]/', '?', $s); }
 function fail(string $s, int $code = 1): never { fwrite(STDERR, $s . "\n"); exit($code); }
 function duration(int $s): string
 {
@@ -140,7 +143,7 @@ try {
             printf("%-6s %-40s %-9s %-19s %-16s %8s %10s\n", 'id', 'email', 'status', 'created', 'last seen (UTC)', 'profiles', 'storage');
             foreach ($rows as $u) {
                 $seen = max((int) $u['last_seen'], (int) $u['last_login']);
-                printf("%-6d %-40s %-9s %-19s %-16s %8d %10s\n", $u['id'], mb_strimwidth($u['email'], 0, 40, '…'),
+                printf("%-6d %-40s %-9s %-19s %-16s %8d %10s\n", $u['id'], mb_strimwidth(clean($u['email']), 0, 40, '…'),
                     $u['status'] === 'banned' ? 'suspended' : $u['status'], $u['created'],
                     $seen ? gmdate('Y-m-d H:i', $seen) : '-', $u['profiles'], number_format($u['bytes'] / 1024, 1) . ' KB');
             }
@@ -151,29 +154,29 @@ try {
         case 'suspend':
             $u = $account($needEmail());
             $admin->suspend($u['id']);
-            out("Suspended {$u['email']} and signed it out everywhere.");
+            out("Suspended " . clean($u['email']) . " and signed it out everywhere.");
             break;
 
         case 'unsuspend':
             $u = $account($needEmail());
             $admin->unsuspend($u['id']);
-            out("{$u['email']} can sign in again.");
+            out(clean($u['email']) . " can sign in again.");
             break;
 
         case 'signout':
             $u = $account($needEmail());
             $n = $admin->signOut($u['id']);
-            out("Signed {$u['email']} out ($n device" . ($n === 1 ? '' : 's') . ').');
+            out("Signed " . clean($u['email']) . " out ($n device" . ($n === 1 ? '' : 's') . ').');
             break;
 
         case 'delete':
             $u = $account($needEmail());
             if (!$yes) {
-                $typed = ask("This deletes {$u['email']} and everything it holds on this server, for good.\nType the email again to go on: ");
+                $typed = ask("This deletes " . clean($u['email']) . " and everything it holds on this server, for good.\nType the email again to go on: ");
                 if (strtolower(trim($typed)) !== strtolower($u['email'])) fail('Not deleted.');
             }
             $admin->delete($u['id']);
-            out("Deleted {$u['email']}.");
+            out("Deleted " . clean($u['email']) . ".");
             break;
 
         case 'check':
@@ -207,12 +210,22 @@ try {
                     out('  SUBMARINE_TRUSTED_PROXIES, or every user shares its rate limits.');
                 }
             }
-            $hash = password_hash('measure', PASSWORD_DEFAULT);
+            // The slowest check a failed sign-in can run: the dummy hash at
+            // today's cost, or the costliest hash an account still has (it is
+            // redone at today's cost at that account's next sign-in).
+            $costs = [(int) substr(Auth::dummyHash(), 4, 2)];
+            $st = $db->prepare('SELECT DISTINCT SUBSTRING(password_hash, 5, 2) FROM users WHERE password_hash LIKE ?');
+            $st->execute(['$2y$%']);
+            foreach ($st->fetchAll(PDO::FETCH_COLUMN) as $c) {
+                if (ctype_digit((string) $c)) $costs[] = (int) $c;
+            }
+            $cost = min(max($costs), 14);
+            $hash = password_hash('measure', PASSWORD_BCRYPT, ['cost' => $cost]);
             $t0 = microtime(true);
             for ($i = 0; $i < 3; $i++) password_verify('measure x', $hash);
             $ms = (int) round((microtime(true) - $t0) / 3 * 1000);
             $floor = (int) $config['limits']['login_fail_floor_ms'];
-            out("Password check: $ms ms here; failed sign-ins are answered at $floor ms"
+            out("Password check (bcrypt cost $cost): $ms ms here; failed sign-ins are answered at $floor ms"
                 . ($ms > $floor - 200 ? '. RAISE limits.login_fail_floor_ms to about ' . (int) (ceil(($ms + 300) / 100) * 100) . ' ms, or the time of an answer can tell whether an email has an account.' : '.'));
             break;
 

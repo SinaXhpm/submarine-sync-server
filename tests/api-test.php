@@ -171,13 +171,42 @@ clearRL();
 req('POST', '/auth/signup', ['email' => 'guest@stage.test']);
 check('an invitation survives a sign-up with the same address', req('GET', '/auth/verify?token=' . ($m[1] ?? ''))['code'], 200);
 
-setConfig(['signup' => 'open', 'max_accounts' => (int) one('SELECT COUNT(*) FROM users'), 'mail' => ['transport' => 'smtp', 'smtp_host' => '127.0.0.1', 'smtp_port' => 9, 'smtp_security' => 'none', 'from_address' => 'sync@stage.test']]);
+setConfig(['signup' => 'open', 'max_accounts' => (int) one('SELECT COUNT(*) FROM users WHERE status <> "pending"'), 'mail' => ['transport' => 'smtp', 'smtp_host' => '127.0.0.1', 'smtp_port' => 9, 'smtp_security' => 'none', 'from_address' => 'sync@stage.test']]);
 clearRL();
 $r = req('POST', '/auth/signup', ['email' => 'onemore@stage.test']);
 check('max_accounts reached: no new account', [$r['code'], $r['json']['error'] ?? null, (int) one('SELECT COUNT(*) FROM users WHERE email = ?', ['onemore@stage.test'])], [403, 'signup_full', 0]);
 $r2 = req('POST', '/auth/signup', ['email' => 'invited@stage.test']);
 check('a full server answers a registered address the same way', [$r2['code'], $r2['body']], [403, $r['body']]);
 restoreConfig();
+
+// Only finished accounts count: sign-ups nobody finishes can't fill the server.
+$finished = (int) one('SELECT COUNT(*) FROM users WHERE status <> "pending"');
+setConfig(['signup' => 'open', 'max_accounts' => $finished + 1, 'mail' => ['transport' => 'smtp', 'smtp_host' => '127.0.0.1', 'smtp_port' => 9, 'smtp_security' => 'none', 'from_address' => 'sync@stage.test']]);
+for ($i = 1; $i <= 5; $i++) mkpending("never-finished$i@stage.test");
+clearRL();
+$r = req('POST', '/auth/signup', ['email' => 'room-left@stage.test']);
+check('unfinished sign-ups leave room for a real one', [$r['code'], $r['json']['status'] ?? null], [200, 'pending']);
+$late = mkpending('late-signup@stage.test');
+$lateCode = mktoken($late, 'verify');
+mkuser('fills-the-last-place@stage.test');
+clearRL();
+$r = req('GET', '/auth/verify?token=' . $lateCode);
+check('once full, a sign-up code can\'t finish an account (the code stays usable)', [$r['code'], $r['json']['error'] ?? null,
+    one('SELECT used_at FROM verify_tokens WHERE user_id = ?', [$late])], [403, 'signup_full', null]);
+$inv = mkpending('admin-invited@stage.test');
+$invCode = mktoken($inv, 'invite');
+check('an invitation the admin made still works on a full server', req('GET', '/auth/verify?token=' . $invCode)['code'], 200);
+restoreConfig();
+
+// Email addresses: the plain printable form only.
+foreach (['first.last+tag@sub.example.co' => true, "o'neil@example.com" => true, 'a@b' => false,
+          '"quoted"@example.com' => false, "\"a\x1b[8mb\"@example.com" => false, '"a\\ b"@example.com' => false,
+          "x\n@example.com" => false, 'a b@example.com' => false, 'ab@-example.com' => false] as $addr => $ok) {
+    check('validEmail(' . json_encode($addr) . ')', \Submarine\Lib\Util::validEmail($addr), $ok);
+}
+clearRL();
+$r = req('POST', '/auth/login', ['email' => "\"a\x1b[8mb\"@example.com", 'password' => 'correct horse 1']);
+check('a quoted address with control bytes is refused', [$r['code'], $r['json']['error'] ?? null], [400, 'invalid_input']);
 
 // ===========================================================================
 section('JSON bodies only');

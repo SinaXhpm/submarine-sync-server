@@ -32,7 +32,8 @@ return [
     // 'open': anyone can sign up in the app; needs mail for their code.
     'signup' => 'invite',
 
-    // Most accounts this server holds (0: no limit).
+    // Most accounts sign-up may make (0: no limit). Only finished accounts
+    // count; your own invitations are never held back by it.
     'max_accounts' => 0,
 
     // The path the server answers under, when it is not the root of its host

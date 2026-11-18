@@ -1,18 +1,31 @@
 # Submarine sync server with Docker Compose.
 #
+#   sudo bash install.sh --domain ...       # all of the below, on a new server
+#
 #   ./setup.sh                              # makes .env with random secrets
 #   docker compose up -d                    # the server, on http://127.0.0.1:8080
 #   docker compose --profile https up -d    # plus Caddy: HTTPS on ports 80/443
-#                                           # for SUBMARINE_DOMAIN (set it in .env)
+#                                           # for SUBMARINE_DOMAIN (set it in .env;
+#                                           # COMPOSE_PROFILES=https there does
+#                                           # the same as --profile https)
 #
 # Settings come from .env; see .env.example and README.md.
 
 name: submarine-sync
 
+# Every service keeps at most 3 log files of 10 MB: the access log has a line
+# per request, and Docker keeps logs forever otherwise.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   db:
     image: mariadb:11.4.12
     restart: unless-stopped
+    logging: *logging
     environment:
       MARIADB_DATABASE: submarine
       MARIADB_USER: submarine
@@ -33,6 +46,7 @@ services:
     build: .
     image: ${SUBMARINE_IMAGE:-submarine-sync-server:local}
     restart: unless-stopped
+    logging: *logging
     depends_on:
       db:
         condition: service_healthy
@@ -88,6 +102,7 @@ services:
     image: ${SUBMARINE_IMAGE:-submarine-sync-server:local}
     pull_policy: never   # built by the app service
     restart: unless-stopped
+    logging: *logging
     depends_on:
       app:
         condition: service_healthy
@@ -107,6 +122,7 @@ services:
     image: caddy:2.11.7-alpine
     profiles: ["https"]
     restart: unless-stopped
+    logging: *logging
     # It binds ports 80 and 443 inside its container, and needs nothing else.
     cap_drop: [ALL]
     cap_add: [NET_BIND_SERVICE]
@@ -132,3 +148,11 @@ volumes:
   db:
   caddy_data:
   caddy_config:
+
+networks:
+  default:
+    # IPv6 inside Docker's network (SUBMARINE_IPV6=true; Docker 27 or newer).
+    # Without it, Docker passes a connection that came in over IPv6 on
+    # through a proxy of its own, so Caddy (and the rate limits) see that
+    # proxy's address for every IPv6 user. Off by default: see README, "IPv6".
+    enable_ipv6: ${SUBMARINE_IPV6:-false}
