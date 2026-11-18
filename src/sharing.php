@@ -34,11 +34,16 @@ $share_deleted = static function (PDO $db, string $shareId): bool {
 
 /**
  * My membership row for a share, or false. Returns role, status, sealed_dek.
+ * Only for a share that still exists: a membership row that outlived its share
+ * (an invitation that crossed the share's deletion) opens nothing, and
+ * bin/cron.php removes it.
  */
 $share_role = static function (PDO $db, string $shareId, int $uid) {
     $st = $db->prepare(
-        'SELECT role, status, sealed_dek FROM profile_members
-          WHERE share_id = ? AND member_user_id = ?'
+        'SELECT m.role, m.status, m.sealed_dek
+           FROM profile_members m
+           JOIN shared_profiles s ON s.share_id = m.share_id
+          WHERE m.share_id = ? AND m.member_user_id = ?'
     );
     $st->execute([$shareId, $uid]);
     return $st->fetch();
@@ -522,6 +527,25 @@ if ($method === 'POST' && $path === '/shares/sync') {
     \Submarine\Lib\SyncDelta::ensure($db, 'shared_revs', 'shared_records', $partition, (bool) $records);
     $db->beginTransaction();
     $delta = \Submarine\Lib\SyncDelta::open($db, 'shared_revs', 'shared_records', $partition, $body);
+    // The membership again, now that the share's counter is this exchange's:
+    // a deletion of the share takes that lock first, so one that finished
+    // while this request waited (or before it made the counter) is seen here.
+    // A plain read: it is the transaction's first, so it sees every commit
+    // made before the lock was granted.
+    $again = $share_role($db, $sid, (int) $c['user_id']);
+    if (!$again || $again['status'] !== 'active' || ($again['role'] === 'user' && count($records) > 0)) {
+        $db->rollBack();
+        if (!$again && $share_deleted($db, $sid)) {
+            // The counter this request may have made for it before the
+            // transaction (SyncDelta::ensure) goes too.
+            $db->prepare('DELETE FROM shared_revs WHERE share_id = ?')->execute([$sid]);
+            \Submarine\Lib\Util::sendError(410, 'share_deleted', 'This shared profile was deleted by its owner.');
+        }
+        if ($again && $again['status'] === 'active') {
+            \Submarine\Lib\Util::sendError(403, 'read_only', 'your role can use this profile but not edit it');
+        }
+        \Submarine\Lib\Util::sendError(403, 'forbidden', 'not an active member of this share');
+    }
     $usedQ->execute([$sid]);
     $before = $usedQ->fetch();
     $up = $db->prepare(

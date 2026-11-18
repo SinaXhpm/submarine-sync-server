@@ -48,6 +48,11 @@ foreach (['X-Forwarded-For' => '203.0.113.9', 'Forwarded' => 'for=203.0.113.9', 
 check('the old path stays a 404', req('GET', '/admin')['code'], 404);
 $r = panel('GET');
 check('the sign-in page', [$r['code'], str_contains($r['body'], 'Admin password')], [200, true]);
+// Both must say "this machine": the address, and the name the browser used.
+// A reverse proxy here that passes the public name on (without proxy headers)
+// is not a browser on this machine.
+check('switched on, from this machine but under another name: refused', panel('GET', '', [], ['Host' => 'sync.example.test'])['code'], 403);
+check('the gateway rule is only for the Docker image', \Submarine\Lib\Util::dockerGateway(), null);
 check('with a trailing slash too', panel('GET', '/')['code'], 200);
 check('a near miss is a 404', req('GET', '/managex')['code'], 404);
 preg_match('/^content-security-policy: ([^\r\n]+)/mi', $r['head'], $csp);
@@ -67,6 +72,10 @@ check('it is in the event log', (int) one("SELECT COUNT(*) FROM auth_events WHER
 for ($i = 0; $i < 4; $i++) panel('POST', '', ['do' => 'login', 'password' => "wrong $i"]);
 $r = panel('POST', '', ['do' => 'login', 'password' => $pw]);
 check('after five failures even the right one waits', [$r['code'], str_contains($r['body'], 'Too many failed tries')], [401, true]);
+$t0 = microtime(true);
+for ($i = 0; $i < 3; $i++) panel('POST', '', ['do' => 'login', 'password' => "more $i"]);
+check('refused tries are answered at once (no pause holds a worker)', (microtime(true) - $t0) * 1000 < 450, true);
+check('and logged once per address and window', (int) one("SELECT COUNT(*) FROM auth_events WHERE event = 'admin_login' AND detail = 'rate_limited'"), 1);
 clearRL();
 $pdo->prepare('INSERT INTO rate_limits (bucket, window_start, hits) VALUES (?, ?, 50)')->execute(['admin:login:all', intdiv(time(), 3600) * 3600]);
 $r = panel('POST', '', ['do' => 'login', 'password' => $pw]);
@@ -195,7 +204,13 @@ restoreConfig();
 // ===========================================================================
 section('the command line');
 [$rc, $out] = cli('check');
-check('check', [$rc, str_contains($out, 'Settings: OK'), str_contains($out, 'Database: OK'), str_contains($out, 'Password check:')], [0, true, true, true]);
+check('check', [$rc, str_contains($out, 'Settings: OK'), str_contains($out, 'Database: OK'), str_contains($out, 'Password check (bcrypt cost ')], [0, true, true, true]);
+// It measures the costliest hash an account still has, not only today's cost.
+$pdo->prepare('INSERT INTO users (email, password_hash, status) VALUES (?, ?, "active")')
+    ->execute(['cost13@stage.test', password_hash('cost 13 password', PASSWORD_BCRYPT, ['cost' => 13])]);
+[$rc, $out] = cli('check');
+check('check measures a cost-13 hash an account still has', str_contains($out, 'Password check (bcrypt cost 13)'), true);
+$pdo->prepare('DELETE FROM users WHERE email = ?')->execute(['cost13@stage.test']);
 [$rc, $out] = cli('list');
 check('list', [$rc, str_contains($out, 'bob@stage.test')], [0, true]);
 [$rc, $out] = cli('list', 'zzz-nobody');

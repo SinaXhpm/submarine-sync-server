@@ -61,7 +61,7 @@ final class Bootstrap
         }
         $db = self::openDb($config);
         $rl     = new RateLimit($db);
-        $audit  = new Audit($db);
+        $audit  = new Audit($db, $rl);
         $auth   = new Auth($db, $rl, $audit, $config);
         $mailer = new Mailer($config, $audit);
         $ip     = Util::clientIp($config);

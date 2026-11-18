@@ -47,19 +47,23 @@ $now    = time();
 $https  = Util::isHttps($config);
 $remote = (string) ($_SERVER['REMOTE_ADDR'] ?? '');
 // Plain http is allowed only when the operator switched it on, and only for a
-// browser on this machine: the connection comes from loopback, or the browser
-// was given a loopback address (Docker's published port, an SSH tunnel). A
-// request that carries any proxy header came through a proxy (nginx's
-// proxy_pass to 127.0.0.1, cloudflared, Apache's ProxyPass), whatever its
-// address or Host says, so it never counts as local.
+// browser on this machine. Both must say so: the browser was given a loopback
+// name (http://localhost..., also through an SSH tunnel), and the connection
+// comes from this machine (loopback; in the Docker image, from the host,
+// whose connections to the published port arrive from the container's
+// gateway). The name alone can be made up by anyone who reaches the port; the
+// address alone is also what a reverse proxy on this machine has. A request
+// that carries any proxy header came through a proxy (nginx's proxy_pass,
+// cloudflared, Apache's ProxyPass), so it never counts as local.
 $proxied = false;
 foreach (['HTTP_X_FORWARDED_FOR', 'HTTP_X_FORWARDED_PROTO', 'HTTP_X_FORWARDED_HOST', 'HTTP_FORWARDED', 'HTTP_X_REAL_IP',
           'HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_SERVER', 'HTTP_VIA'] as $h) {
     if (isset($_SERVER[$h])) $proxied = true;
 }
 $hostName = strtolower((string) preg_replace('/:\d+$/', '', (string) ($_SERVER['HTTP_HOST'] ?? '')));
-$local  = !empty($config['admin']['allow_http_local']) && !$proxied
-    && (in_array($remote, ['127.0.0.1', '::1'], true) || in_array($hostName, ['localhost', '127.0.0.1', '[::1]'], true));
+$fromHere = in_array($remote, ['127.0.0.1', '::1'], true) || ($remote !== '' && $remote === Util::dockerGateway());
+$local  = !empty($config['admin']['allow_http_local']) && !$proxied && $fromHere
+    && in_array($hostName, ['localhost', '127.0.0.1', '[::1]'], true);
 $nonce  = base64_encode(random_bytes(16));
 
 header('Content-Type: text/html; charset=utf-8');
@@ -192,9 +196,13 @@ if ($session === null) {
         $ipTries  = $rl->hit($ipBucket, 900);
         $allTries = $rl->hit('admin:login:all', 3600);
         if ($ipTries > 5 || $allTries > 50) {
-            usleep(500000);
+            // Refused at once, with no pause: a pause for every refused try
+            // would let a flood of them hold all of the server's workers.
+            // Logged once per address and window, not once per try.
+            if ($ipTries === 6 || $allTries === 51) {
+                $audit->log(null, null, $ip, 'admin_login', false, 'rate_limited');
+            }
             $err = 'Too many failed tries. Wait a while, or use php bin/admin.php on the server.';
-            $audit->log(null, null, $ip, 'admin_login', false, 'rate_limited');
         } else {
             $given = is_string($_POST['password'] ?? null) ? $_POST['password'] : '';
             if (strlen($given) <= 1024 && !str_contains($given, "\0") && password_verify($given, $pwHash)) {

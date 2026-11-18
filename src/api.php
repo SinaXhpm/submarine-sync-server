@@ -47,17 +47,50 @@ define('ACCOUNT_MAIL_FLOOR_MS', (int) $config['limits']['account_mail_floor_ms']
 $pepper = (string) $config['security']['token_pepper'];
 
 /**
- * Send one of the account emails, after the answer has gone out. Mail is
- * capped for the whole server (mail.per_hour), so a flood of requests for many
- * addresses can't turn it into a mail cannon.
+ * Mail is capped for the whole server (mail.per_hour), so a flood of requests
+ * for many addresses can't turn it into a mail cannon. Sign-up codes may use
+ * half of an hour's mail: a flood of sign-ups for made-up addresses can't hold
+ * back the reset and sign-in codes of real accounts.
+ *
+ * @return array{0: ?string, 1: int} the kind's own bucket (or null) and its cap
  */
+$mailCap = static function (string $kind) use ($config): array {
+    $all = (int) $config['mail']['per_hour'];
+    return $kind === 'verify' ? ['mail:signup', max(1, intdiv($all + 1, 2))] : [null, $all];
+};
+
+/**
+ * Whether one more mail of this kind may go out this hour (counts nothing).
+ * When it may not, no code is made at all: a code that is never sent would
+ * only push out the ones already sent (three stay valid per account).
+ */
+$mailBudgetLeft = static function (string $kind) use ($rl, $config, $mailCap): bool {
+    [$bucket, $cap] = $mailCap($kind);
+    if ($bucket !== null && $rl->count($bucket, 3600) >= $cap) {
+        return false;
+    }
+    return $rl->count('mail:all', 3600) < (int) $config['mail']['per_hour'];
+};
+
+/** Send one of the account emails, after the answer has gone out, within the caps. */
 $sendAccountMail = static function (string $kind, int $userId, string $email, callable $send)
-    use ($rl, $audit, $config, $ip): void {
-    if ($rl->hit('mail:all', 3600) > (int) $config['mail']['per_hour']) {
+    use ($rl, $audit, $config, $ip, $mailCap): void {
+    [$bucket, $cap] = $mailCap($kind);
+    $over = $rl->hit('mail:all', 3600) > (int) $config['mail']['per_hour'];
+    if (!$over && $bucket !== null) {
+        $over = $rl->hit($bucket, 3600) > $cap;
+    }
+    if ($over) {
         $audit->log($userId, $email, $ip, 'mail_suppressed', false, $kind);
         return;
     }
     $send();
+};
+
+/** Accounts that count toward max_accounts: finished ones (not sign-ups never finished). */
+$fullServer = static function () use ($db, $config): bool {
+    $max = (int) $config['max_accounts'];
+    return $max > 0 && (int) $db->query('SELECT COUNT(*) FROM users WHERE status <> "pending"')->fetchColumn() >= $max;
 };
 
 /**
@@ -186,9 +219,9 @@ try {
 
         // A full server says so to everybody, before any address is looked
         // at: an answer that depended on the address would tell which ones
-        // have an account.
-        $max = (int) $config['max_accounts'];
-        if ($max > 0 && (int) $db->query('SELECT COUNT(*) FROM users')->fetchColumn() >= $max) {
+        // have an account. Only finished accounts count: sign-ups nobody
+        // finishes can't fill the server.
+        if ($fullServer()) {
             Util::sendError(403, 'signup_full', 'This server takes no new accounts right now.');
         }
 
@@ -203,6 +236,13 @@ try {
         [$emMax, $emWindow] = $config['limits']['rate_email_signup'];
         $rl->enforce("signup:email:$email", $emMax, $emWindow);
         $answer = ['status' => 'pending', 'message' => 'Check your inbox'];
+
+        // The hour's sign-up mail is used up: nothing is made or changed (the
+        // code someone already has keeps working), and the answer is the same.
+        if (!$mailBudgetLeft('verify')) {
+            $audit->log(null, $email, $ip, 'mail_suppressed', false, 'verify');
+            $sameAnswer($answer);
+        }
 
         $db->beginTransaction();
         $stmt = $db->prepare('SELECT id, status FROM users WHERE email = ? FOR UPDATE');
@@ -273,6 +313,12 @@ try {
         }
         if ($row['status'] === 'banned') {
             Util::sendError(403, 'account_banned', 'Account suspended');
+        }
+        // A sign-up code can't finish an account once the server is full (an
+        // admin's invitation can: the admin chose to make it). The code stays
+        // usable until it expires, in case room is made.
+        if ($row['purpose'] === 'verify' && $fullServer()) {
+            Util::sendError(403, 'signup_full', 'This server takes no new accounts right now.');
         }
 
         $db->beginTransaction();
@@ -383,7 +429,7 @@ try {
         if ($usable && !$locked && !str_contains($password, "\0")) {
             $okPwd = password_verify($password, (string) $row['password_hash']);
         } else {
-            password_verify(str_replace("\0", '', $password), Auth::DUMMY_PASSWORD_HASH);
+            password_verify(str_replace("\0", '', $password), Auth::dummyHash());
             $okPwd = false;
         }
 
@@ -472,6 +518,10 @@ try {
             $sameAnswer($answer);
         }
         $userId = (int) $row['id'];
+        if (!$mailBudgetLeft('reset')) {
+            $audit->log($userId, $email, $ip, 'mail_suppressed', false, 'reset');
+            $sameAnswer($answer);
+        }
         $pruneTokens($userId, 'reset');
         $token = Util::randomToken(24);
         $db->prepare('INSERT INTO verify_tokens (token_hash, user_id, purpose, expires_at) VALUES (?, ?, "reset", ?)')
@@ -527,7 +577,9 @@ try {
         }
         $uid = (int) $row['user_id'];
         $db->prepare('UPDATE users SET password_hash = ?, failed_login_count = 0, locked_until = NULL WHERE id = ?')->execute([$hash, $uid]);
-        $db->prepare('DELETE FROM verify_tokens WHERE user_id = ? AND purpose = "reset" AND token_hash <> ?')->execute([$uid, $tokenHash]);
+        // Every other code of the account goes too: a sign-in code someone
+        // else saw must not outlive the new password.
+        $db->prepare('DELETE FROM verify_tokens WHERE user_id = ? AND token_hash <> ?')->execute([$uid, $tokenHash]);
         $db->prepare('DELETE FROM auth_tokens WHERE user_id = ?')->execute([$uid]);
         $authToken = $issueToken($uid);
         $db->commit();
@@ -562,6 +614,10 @@ try {
             $sameAnswer($answer);
         }
         $userId = (int) $row['id'];
+        if (!$mailBudgetLeft('login_link')) {
+            $audit->log($userId, $email, $ip, 'mail_suppressed', false, 'login_link');
+            $sameAnswer($answer);
+        }
         $pruneTokens($userId, 'login');
         $token = Util::randomToken(24);
         $db->prepare('INSERT INTO verify_tokens (token_hash, user_id, purpose, expires_at) VALUES (?, ?, "login", ?)')

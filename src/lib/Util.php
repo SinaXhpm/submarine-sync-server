@@ -317,6 +317,34 @@ final class Util
         return $proto === 'https' && $trusted && self::isTrustedProxy($remote, $trusted);
     }
 
+    /**
+     * In the Docker image (SUBMARINE_IN_DOCKER=1): the container's default
+     * gateway, the address connections from the host machine to the
+     * published port arrive from. Null anywhere else, and when it can't be
+     * read: outside a container, the default gateway is a router.
+     */
+    public static function dockerGateway(): ?string
+    {
+        static $gw = false;
+        if ($gw !== false) {
+            return $gw;
+        }
+        $gw = null;
+        if (getenv('SUBMARINE_IN_DOCKER') !== '1') {
+            return $gw;
+        }
+        foreach (@file('/proc/net/route', FILE_IGNORE_NEW_LINES) ?: [] as $line) {
+            $f = preg_split('/\s+/', trim($line));
+            // Destination 0.0.0.0 is the default route; the gateway is a
+            // 32-bit number in the machine's own byte order.
+            if (($f[1] ?? '') === '00000000' && preg_match('/^[0-9A-Fa-f]{8}$/', $f[2] ?? '') && $f[2] !== '00000000') {
+                $gw = (string) inet_ntop(pack('L', hexdec($f[2])));
+                break;
+            }
+        }
+        return $gw;
+    }
+
     /** Whether an address is one of the trusted proxies (IP, CIDR or host name). */
     public static function isTrustedProxy(string $ip, array $trusted): bool
     {
@@ -429,10 +457,19 @@ final class Util
         usleep(random_int($minMs * 1000, $maxMs * 1000));
     }
 
-    /** An email address as the API takes it (ASCII, 191 characters at most). */
+    /**
+     * An email address as the API takes it: 191 characters at most, printable
+     * ASCII in the plain form (the one HTML forms take). FILTER_VALIDATE_EMAIL
+     * alone also takes quoted names with control characters in them, which
+     * would reach the admin's terminal (bin/admin.php list), the mail headers
+     * and other members' screens.
+     */
     public static function validEmail(string $email): bool
     {
         if (strlen($email) > 191) return false;
+        if (!preg_match('/^[A-Za-z0-9.!#$%&\'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\z/', $email)) {
+            return false;
+        }
         return (bool) filter_var($email, FILTER_VALIDATE_EMAIL);
     }
 

@@ -80,6 +80,8 @@ $floor = (int) $cfg['limits']['login_fail_floor_ms'];
 check("no failed sign-in answers before $floor ms", min(array_map('min', $t)) >= $floor - 5, true);
 check('all kinds of failure take the same time (medians within 80 ms)', max($med) - min($med) <= 80, true);
 restoreConfig();
+check('the dummy hash has the cost new hashes get here', password_get_info(\Submarine\Lib\Auth::dummyHash())['options']['cost'] ?? null,
+    password_get_info(password_hash('x', PASSWORD_DEFAULT))['options']['cost'] ?? null);
 
 section('old password hashes are redone at today\'s cost');
 $old = mkuser('oldhash@stage.test', 'old hash pass 1', ['cost' => 10]);
@@ -150,18 +152,35 @@ clearRL();
 req('POST', '/auth/request-login', ['email' => 'keep@stage.test']);
 check('a used code is never one of the kept ones', (int) one('SELECT COUNT(*) FROM verify_tokens WHERE user_id = ? AND purpose = "login" AND used_at IS NULL', [$ku['id']]), 3);
 
-section('mail goes out after the answer, under an hourly cap');
-setConfig(array_replace_recursive($mailOn, ['signup' => 'open', 'mail' => ['per_hour' => 2]]));
+section('mail goes out after the answer, under an hourly cap; sign-ups get half of it');
+// per_hour 4: sign-up codes may use 2, and the rest stays for real accounts.
+$mo = mkuser('mailcap-owner@stage.test');
+setConfig(array_replace_recursive($mailOn, ['signup' => 'open', 'mail' => ['per_hour' => 4]]));
+$mailRows = fn (string $email): int => (int) one('SELECT COUNT(*) FROM auth_events WHERE event IN ("mail_failed", "mail_suppressed") AND email = ?', [$email]);
+$kindsOf = fn (string $like): array => array_map(fn ($k) => [$k['event'], (int) $k['n']],
+    rows('SELECT event, COUNT(*) n FROM auth_events WHERE event IN ("mail_failed", "mail_suppressed") AND email LIKE ? GROUP BY event ORDER BY event', [$like]));
 $answers = [];
 for ($i = 1; $i <= 3; $i++) {
     $r = req('POST', '/auth/signup', ['email' => "mailcap$i@stage.test"]);
     $answers[] = [$r['code'], $r['json']['status'] ?? null, $r['ms'] < 2000];
+    // The mail, and its count, come after the answer.
+    waitFor(fn () => $mailRows("mailcap$i@stage.test"), 30);
 }
 check('three signups answered at once', $answers, [[200, 'pending', true], [200, 'pending', true], [200, 'pending', true]]);
-waitFor(fn () => (int) one('SELECT COUNT(*) FROM auth_events WHERE event IN ("mail_failed", "mail_suppressed") AND email LIKE "mailcap%"') >= 3 ? 1 : 0, 30);
-$kinds = rows('SELECT event, COUNT(*) n FROM auth_events WHERE event IN ("mail_failed", "mail_suppressed") AND email LIKE "mailcap%" GROUP BY event ORDER BY event');
-check('two tried (nobody listens, so they fail), the third held back by the cap',
-    array_map(fn ($k) => [$k['event'], (int) $k['n']], $kinds), [['mail_failed', 2], ['mail_suppressed', 1]]);
+check('two tried (nobody listens, so they fail), the third held back: sign-ups get half', $kindsOf('mailcap_@stage.test'),
+    [['mail_failed', 2], ['mail_suppressed', 1]]);
+check('the held-back sign-up made no account and no code', (int) one('SELECT COUNT(*) FROM users WHERE email = ?', ['mailcap3@stage.test']), 0);
+req('POST', '/auth/request-reset', ['email' => 'mailcap-owner@stage.test']);
+waitFor(fn () => $mailRows('mailcap-owner@stage.test') >= 1 ? 1 : 0, 30);
+req('POST', '/auth/request-login', ['email' => 'mailcap-owner@stage.test']);
+waitFor(fn () => $mailRows('mailcap-owner@stage.test') >= 2 ? 1 : 0, 30);
+check('an account still gets its reset and sign-in codes after the sign-ups', [$kindsOf('mailcap-owner@stage.test'),
+    (int) one('SELECT COUNT(*) FROM verify_tokens WHERE user_id = ? AND purpose IN ("reset", "login")', [$mo['id']])], [[['mail_failed', 2]], 2]);
+// The hour's 4 mails are gone now.
+$codesBefore = rows('SELECT token_hash FROM verify_tokens WHERE user_id = ? ORDER BY token_hash', [$mo['id']]);
+for ($i = 0; $i < 3; $i++) req('POST', '/auth/request-login', ['email' => 'mailcap-owner@stage.test']);
+check('a spent hour makes no new codes, and keeps the ones already sent', rows('SELECT token_hash FROM verify_tokens WHERE user_id = ? ORDER BY token_hash', [$mo['id']]), $codesBefore);
+check('each of those is logged as held back', (int) one('SELECT COUNT(*) FROM auth_events WHERE event = "mail_suppressed" AND email = ? AND detail = "login_link"', ['mailcap-owner@stage.test']), 3);
 restoreConfig();
 
 section('limits and their answers');
@@ -477,6 +496,59 @@ $pdo->commit();
 check('410 share_deleted', [$code, $json['error'] ?? null], [410, 'share_deleted']);
 check('the share stays deleted', (int) one('SELECT COUNT(*) FROM shared_profiles WHERE share_id = ?', [$dwid]), 0);
 
+section('a share deleted while a push to it waits: 410, nothing of it left');
+// The push passed its membership check and waits; the owner deletes the share;
+// the push must not then write records (or a revision counter) for a share
+// nobody can reach any more. Once while it makes the share's first counter (a
+// gap lock holds its insert), once while it waits for an existing counter.
+$sdel = function (string $sid): void {
+    global $pdo;
+    foreach (['shared_records', 'shared_revs', 'profile_members', 'shared_profiles'] as $t) {
+        $pdo->prepare("DELETE FROM `$t` WHERE share_id = ?")->execute([$sid]);
+    }
+    $pdo->prepare('INSERT INTO deleted_shares (share_id, deleted_at) VALUES (?, ?)')->execute([$sid, time()]);
+};
+foreach (['first counter' => false, 'existing counter' => true] as $label => $hasCounter) {
+    $pw = mkuser('push-gone-' . bin2hex(random_bytes(3)) . '@stage.test');
+    $pwid = bin2hex(random_bytes(16));
+    api($pw, 'POST', '/shares/create', ['share_id' => $pwid, 'name' => 'P', 'sealed_dek' => 'ab']);
+    if ($hasCounter) {
+        api($pw, 'POST', '/shares/sync', ['share_id' => $pwid, 'since' => '', 'records' => [rec('servers', $now)]]);
+    }
+    $pdo->beginTransaction();
+    $pdo->prepare('SELECT rev FROM shared_revs WHERE share_id = ? FOR UPDATE')->execute([$pwid]);
+    $h = startRequest('/shares/sync', ['share_id' => $pwid, 'since' => '', 'records' => [rec('servers', $now + 5)]], $pw['tok']);
+    $sdel($pwid);
+    $pdo->commit();
+    [$code, $json] = finishRequest($h);
+    check("$label: 410 share_deleted", [$code, $json['error'] ?? null], [410, 'share_deleted']);
+    check("$label: no record or counter of the deleted share", (int) one('SELECT
+        (SELECT COUNT(*) FROM shared_records WHERE share_id = ?) + (SELECT COUNT(*) FROM shared_revs WHERE share_id = ?)', [$pwid, $pwid]), 0);
+}
+
+section('a membership left behind for a deleted share opens nothing');
+// A row that outlived its share (an invitation that crossed the deletion):
+// the share is gone for every endpoint, and the clean-up removes the row.
+$om = mkuser('orphan-member@stage.test');
+$omid = bin2hex(random_bytes(16));
+$pdo->prepare('INSERT INTO deleted_shares (share_id, deleted_at) VALUES (?, ?)')->execute([$omid, time()]);
+$pdo->prepare('INSERT INTO profile_members (share_id, member_user_id, role, sealed_dek, status, invited_by, created_at)
+               VALUES (?, ?, "editor", "ab", "pending", ?, ?)')->execute([$omid, $om['id'], $om['id'], time()]);
+check('accept: 404', api($om, 'POST', '/shares/accept', ['share_id' => $omid])['code'], 404);
+$pdo->prepare('UPDATE profile_members SET status = "active" WHERE share_id = ?')->execute([$omid]);
+check('dek: 410', api($om, 'POST', '/shares/dek', ['share_id' => $omid])['code'], 410);
+check('members: 403', api($om, 'POST', '/shares/members', ['share_id' => $omid])['code'], 403);
+$r = api($om, 'POST', '/shares/sync', ['share_id' => $omid, 'since' => '', 'records' => [rec('servers', $now)]]);
+check('sync: 410, nothing written', [$r['code'], (int) one('SELECT COUNT(*) FROM shared_records WHERE share_id = ?', [$omid])], [410, 0]);
+$pdo->prepare('INSERT IGNORE INTO shared_records (share_id, uuid, entity_type, updated_at, deleted, rev) VALUES (?, "ab", "servers", ?, 1, 1)')
+    ->execute([$omid, stamp($now)]);
+$pdo->prepare('INSERT IGNORE INTO shared_revs (share_id, rev, epoch) VALUES (?, 1, "00000000000000ab")')->execute([$omid]);
+exec(escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg(ROOT . '/bin/cron.php') . ' 2>&1', $cronOut, $cronRc);
+check('cron removes what is left of a deleted share', [$cronRc, (int) one('SELECT
+    (SELECT COUNT(*) FROM profile_members WHERE share_id = ?) + (SELECT COUNT(*) FROM shared_records WHERE share_id = ?)
+  + (SELECT COUNT(*) FROM shared_revs WHERE share_id = ?)', [$omid, $omid, $omid])], [0, 0]);
+check('cron keeps the deleted id itself', (int) one('SELECT COUNT(*) FROM deleted_shares WHERE share_id = ?', [$omid]), 1);
+
 section('/shares/sync takes a record\'s blob only as text');
 $sb = mkuser('share-blob@stage.test');
 $sbid = bin2hex(random_bytes(16));
@@ -524,6 +596,11 @@ check('no password: 403 reauth_required', [$r['code'], $r['json']['error'] ?? nu
 check('and it does not count as a failed login', (int) one('SELECT failed_login_count FROM users WHERE id = ?', [$u['id']]), 0);
 $r = api($u, 'POST', '/auth/delete-account', ['password' => 'wrong password']);
 check('a wrong password: 403, counted', [$r['code'], (int) one('SELECT failed_login_count FROM users WHERE id = ?', [$u['id']])], [403, 1]);
+// bcrypt stops reading at a NUL: the right password with anything after one
+// must not pass for it.
+$r = api($u, 'POST', '/auth/delete-account', ['password' => "right password 1\0anything"]);
+check('the right password, a NUL and more: 403, counted, still there', [$r['code'],
+    (int) one('SELECT failed_login_count FROM users WHERE id = ?', [$u['id']]), (int) one('SELECT COUNT(*) FROM users WHERE id = ?', [$u['id']])], [403, 2, 1]);
 
 section('the right password removes everything of the user');
 $own = bin2hex(random_bytes(16));
@@ -581,6 +658,7 @@ check('unlocked: the right password deletes it', [$r['code'], (int) one('SELECT 
 
 section('a suspended account');
 $s = mkuser('suspend@stage.test', 'right password 3');
+$madeBefore = mktoken($s['id'], 'login');
 [$rc] = cli('suspend', 'suspend@stage.test');
 check('cli suspend', $rc, 0);
 check('its token is gone', api($s, 'GET', '/sync/profiles')['code'], 401);
@@ -591,5 +669,31 @@ check('nor with a sign-in code', req('POST', '/auth/login-with-link', ['login_to
 [$rc] = cli('unsuspend', 'suspend@stage.test');
 clearRL();
 check('unsuspended: it signs in again', [$rc, req('POST', '/auth/login', ['email' => 'suspend@stage.test', 'password' => 'right password 3'])['code']], [0, 200]);
+check('a sign-in code made before the suspension is gone', req('POST', '/auth/login-with-link', ['login_token' => $madeBefore])['code'], 400);
+
+section('a new password or a sign-out everywhere ends the account\'s codes');
+$cu = mkuser('codes@stage.test', 'codes password 1');
+$login1 = mktoken($cu['id'], 'login');
+$reset1 = mktoken($cu['id'], 'reset');
+check('a new password with a reset code', req('POST', '/auth/reset-with-token', ['reset_token' => $reset1, 'password' => 'codes password 2'])['code'], 200);
+check('a sign-in code from before the new password no longer works', req('POST', '/auth/login-with-link', ['login_token' => $login1])['code'], 400);
+$login2 = mktoken($cu['id'], 'login');
+[, $out] = cli('reset-code', 'codes@stage.test');
+preg_match('/^\s{4}([0-9a-f]{48})$/m', $out, $m);
+[$rc] = cli('signout', 'codes@stage.test');
+check('sign out everywhere: the sign-in code and the admin\'s reset code no longer work', [$rc,
+    req('POST', '/auth/login-with-link', ['login_token' => $login2])['code'],
+    req('POST', '/auth/reset-with-token', ['reset_token' => $m[1] ?? '', 'password' => 'codes password 3'])['code']], [0, 400, 400]);
+
+section('failures of no account: at most 60 log rows an hour per address');
+$before = (int) one("SELECT COUNT(*) FROM auth_events WHERE event = 'invalid_token'");
+for ($i = 0; $i < 70; $i++) req('GET', '/sync/profiles', null, ['X-Auth-Token' => str_repeat('ab', 32)]);
+check('70 unknown tokens: 60 rows', (int) one("SELECT COUNT(*) FROM auth_events WHERE event = 'invalid_token'") - $before, 60);
+check('the rate limits still count every one', (int) one("SELECT SUM(hits) FROM rate_limits WHERE bucket = 'global:ip:127.0.0.1'") >= 70, true);
+$ku = mkuser('still-logged@stage.test');
+clearRL();
+for ($i = 0; $i < 3; $i++) req('POST', '/auth/login', ['email' => 'nobody-here@stage.test', 'password' => 'x pw 123']);
+api($ku, 'GET', '/sync/profiles');
+check('a known account\'s events are always logged', (int) one("SELECT COUNT(*) FROM auth_events WHERE user_id = ? AND event = 'sync_profiles'", [$ku['id']]), 1);
 
 done();

@@ -1,0 +1,15 @@
+# Submarine sync server — one backup of the database and the settings.
+# install.sh puts this file and submarine-sync-backup.timer in
+# /etc/systemd/system. Run one by hand: systemctl start submarine-sync-backup
+
+[Unit]
+Description=Submarine sync server backup
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/submarine-sync backup --quiet
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

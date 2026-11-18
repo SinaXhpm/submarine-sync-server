@@ -11,12 +11,25 @@ use PDO;
 
 final class Audit
 {
-    public function __construct(private PDO $db)
+    /**
+     * Failed requests that belong to no account (unknown tokens and codes,
+     * unknown emails) are logged at most this many times an hour per address:
+     * anyone can make them as fast as the rate limits allow, and a row each
+     * would fill the disk. The rate limits themselves still count every one.
+     */
+    public const ANON_FAILURES_PER_HOUR = 60;
+
+    /** $rl: given for web requests, so the cap above applies; the command line logs everything. */
+    public function __construct(private PDO $db, private ?RateLimit $rl = null)
     {
     }
 
     public function log(?int $userId, ?string $email, string $ip, string $event, bool $success = true, ?string $detail = null): void
     {
+        if ($userId === null && !$success && $this->rl !== null
+            && $this->rl->hit('audit:anon:' . Util::rateKeyIp($ip), 3600) > self::ANON_FAILURES_PER_HOUR) {
+            return;
+        }
         $this->db->prepare(
             'INSERT INTO auth_events (user_id, email, ip_address, event, success, detail, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?)'

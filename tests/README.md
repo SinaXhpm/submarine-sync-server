@@ -47,4 +47,12 @@ Each suite prints `PASS` or `FAIL` per check and ends with `ALL PASS` or the num
 SUBMARINE_TEST_DISPOSABLE=1 sh tests/docker/e2e.sh
 ```
 
+## The installer
+
+`tests/install/install-test.sh` runs `install.sh` and the `submarine-sync` command end to end: invitations, the admin panel, backups, restore, a wrong setting, update (a failed one too), running `install.sh` again, and uninstall. It installs into `/opt/submarine-sync` from a throwaway copy of this folder with test releases, uses the domain `localhost` (Caddy's own CA, on 127.0.0.1 only), and removes everything it made at the end. Run it on a machine made for testing; a new Debian or Ubuntu VM is best, because then `install.sh` installs Docker too. It refuses to start where `/opt/submarine-sync` is there already:
+
+```sh
+sudo SUBMARINE_TEST_DISPOSABLE=1 bash tests/install/install-test.sh
+```
+
 The suites need PHP's `curl` extension, besides what the server needs. Some checks measure answer times; on a very busy machine they can fail for that reason alone.

@@ -10,11 +10,24 @@ use PDO;
 final class Auth
 {
     /**
-     * A bcrypt hash of random text that no password matches. A check that has
-     * no real hash to test (no such account, no password yet, locked) tests
-     * this one, so it takes as long as a real one.
+     * Bcrypt hashes of random text that no password matches, one for each
+     * cost PHP has used by default (10 up to PHP 8.3, 12 from 8.4). A check
+     * that has no real hash to test (no such account, no password yet,
+     * locked) tests the one at today's cost, so it takes as long as a real
+     * one: passwords are hashed, and old hashes redone at sign-in, at that
+     * same cost.
      */
-    public const DUMMY_PASSWORD_HASH = '$2y$12$Ul8mg3GWqYwspSW2GscX4OqUNnC0XF6oNjrnmvy8y.lBlZ/YTiSDu';
+    private const DUMMY_HASHES = [
+        10 => '$2y$10$ayFmJjNLWeoP6V0OuGZ.aODZVRCTu08j07Y4smSZH.QN7R2WE1LCe',
+        12 => '$2y$12$Ul8mg3GWqYwspSW2GscX4OqUNnC0XF6oNjrnmvy8y.lBlZ/YTiSDu',
+    ];
+
+    /** The dummy hash at the cost password_hash() uses here. */
+    public static function dummyHash(): string
+    {
+        $cost = defined('PASSWORD_BCRYPT_DEFAULT_COST') ? (int) PASSWORD_BCRYPT_DEFAULT_COST : (PHP_VERSION_ID >= 80400 ? 12 : 10);
+        return self::DUMMY_HASHES[$cost] ?? self::DUMMY_HASHES[$cost < 11 ? 10 : 12];
+    }
 
     private PDO $db;
     private RateLimit $rl;
@@ -147,11 +160,13 @@ final class Auth
         $st = $this->db->prepare('SELECT password_hash, locked_until FROM users WHERE id = ?');
         $st->execute([$userId]);
         $row    = $st->fetch();
-        $hash   = ($row && is_string($row['password_hash']) && $row['password_hash'] !== '')
-            ? $row['password_hash'] : self::DUMMY_PASSWORD_HASH;
+        $real   = $row && is_string($row['password_hash']) && $row['password_hash'] !== '';
+        $hash   = $real ? $row['password_hash'] : self::dummyHash();
         $locked = $row && $row['locked_until'] !== null && (int) $row['locked_until'] > time();
-        $good   = strlen($given) > 0 && strlen($given) <= 1024 && password_verify($given, $hash)
-            && $hash !== self::DUMMY_PASSWORD_HASH && !$locked;
+        // No NUL: bcrypt stops reading at one, so "password\0anything" would
+        // pass. Such a try is still a wrong password below.
+        $usable = strlen($given) > 0 && strlen($given) <= 1024 && !str_contains($given, "\0");
+        $good   = $usable && password_verify($given, $hash) && $real && !$locked;
         if (!$good && $row && !$locked && $given !== '') {
             $this->recordFailedLogin($userId);
         }

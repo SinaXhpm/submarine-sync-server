@@ -97,7 +97,16 @@ is "at http://127.0.0.1:18080/admin (this machine): the sign-in page" "$(curl -s
 is "with another host name: refused" "$(code -H 'Host: sync.example.test' http://127.0.0.1:18080/admin)" 403
 is "through a proxy (X-Forwarded-For), even to localhost: refused" "$(code -H 'X-Forwarded-For: 203.0.113.9' http://127.0.0.1:18080/admin)" 403
 
+CADDYLESS_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' "$($dc ps -q app)")
+is "the panel knows the host's connections come from the gateway ($CADDYLESS_IP)" \
+  "$($dc exec -T app php -r 'require "src/lib/Bootstrap.php"; Submarine\Lib\Bootstrap::registerAutoload(); echo Submarine\Lib\Util::dockerGateway();' | tr -d '\r')" "$CADDYLESS_IP"
+is "another container saying Host: localhost is not this machine" \
+  "$($dc exec -T db bash -c 'exec 3<>/dev/tcp/app/8080 && printf "GET /admin HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3 && head -n 1 <&3' 2>/dev/null | tr -d '\r' | cut -d' ' -f2)" 403
+
 echo "---- the container"
+for s in app db cron; do
+  is "$s keeps at most 3 log files of 10 MB" "$(docker inspect -f '{{.HostConfig.LogConfig.Type}} {{index .HostConfig.LogConfig.Config "max-size"}} {{index .HostConfig.LogConfig.Config "max-file"}}' "$($dc ps -q $s)")" "json-file 10m 3"
+done
 is "runs as www-data" "$($dc exec -T app id -un | tr -d '\r')" www-data
 is "read-only file system" "$($dc exec -T app sh -c 'touch /var/www/submarine/x 2>/dev/null && echo writable || echo read-only' | tr -d '\r')" read-only
 is "the database has no published port" "$(docker inspect -f '{{json .HostConfig.PortBindings}}' "$($dc ps -q db)")" "{}"
