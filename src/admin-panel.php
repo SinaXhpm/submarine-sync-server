@@ -53,8 +53,10 @@ $remote = (string) ($_SERVER['REMOTE_ADDR'] ?? '');
 // whose connections to the published port arrive from the container's
 // gateway). The name alone can be made up by anyone who reaches the port; the
 // address alone is also what a reverse proxy on this machine has. A request
-// that carries any proxy header came through a proxy (nginx's proxy_pass,
-// cloudflared, Apache's ProxyPass), so it never counts as local.
+// that carries any proxy header came through a proxy (cloudflared, Apache's
+// ProxyPass, nginx with the README's proxy_set_header lines), so it never
+// counts as local. A bare nginx proxy_pass sends none, and Host 127.0.0.1:
+// that is why the README's nginx example sets them.
 $proxied = false;
 foreach (['HTTP_X_FORWARDED_FOR', 'HTTP_X_FORWARDED_PROTO', 'HTTP_X_FORWARDED_HOST', 'HTTP_FORWARDED', 'HTTP_X_REAL_IP',
           'HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_SERVER', 'HTTP_VIA'] as $h) {

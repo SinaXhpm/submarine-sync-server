@@ -96,6 +96,22 @@ if [ $DIR_GIVEN = 0 ] && [ -f "${BASH_SOURCE[0]:-}" ]; then
     here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
     if [ -f "$here/docker-compose.yml" ] && [ -f "$here/submarine-sync" ]; then DIR=$here; fi
 fi
+# The command link and the backup timer need the full path.
+case "$DIR" in /*) ;; *) DIR="$PWD/$DIR" ;; esac
+DIR=${DIR%/}
+
+# One server per machine: Docker Compose names its containers and volumes
+# "submarine-sync", so a second folder would take over those of the first
+# (with other database passwords, which locks the server out). Running this
+# again without --dir works on the server that is installed.
+installed=$(readlink -f /usr/local/bin/submarine-sync 2>/dev/null || true)
+if [ -n "$installed" ] && [ -f "$installed" ]; then
+    installed=$(dirname "$installed")
+    if [ $DIR_GIVEN = 0 ] && [ ! -f "$DIR/.env" ]; then DIR=$installed; fi
+    if [ "$(readlink -f "$DIR" 2>/dev/null || printf '%s' "$DIR")" != "$installed" ]; then
+        die "A server is installed in $installed already. Run this with --dir $installed, or remove that one first (submarine-sync uninstall)."
+    fi
+fi
 
 # Whether there is a terminal to ask on (/dev/tty can exist and still not open).
 have_tty() { [ $ASSUME_YES = 0 ] && (exec < /dev/tty) 2>/dev/null; }

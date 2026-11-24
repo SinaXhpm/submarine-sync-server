@@ -11,5 +11,6 @@ Caddyfile
 setup.sh
 install.sh
 submarine-sync
+.submarine-sync.lock
 deploy
 *.md

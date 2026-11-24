@@ -139,8 +139,8 @@ function header_of(array $r, string $name): ?string
     return preg_match('/^' . preg_quote($name, '/') . ':\s*(.+?)\r?$/mi', $r['headers'], $m) ? $m[1] : null;
 }
 
-/** The same request $n times at once; the status codes, sorted. */
-function race(int $n, string $method, string $path, array $body): array
+/** The same request $n times at once (or $body($i) for request $i); the status codes, sorted. */
+function race(int $n, string $method, string $path, array|Closure $body): array
 {
     $mh = curl_multi_init();
     $hs = [];
@@ -150,7 +150,7 @@ function race(int $n, string $method, string $path, array $body): array
             CURLOPT_CUSTOMREQUEST  => $method,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
-            CURLOPT_POSTFIELDS     => json_encode($body),
+            CURLOPT_POSTFIELDS     => json_encode($body instanceof Closure ? $body($i) : $body),
             CURLOPT_TIMEOUT        => 60,
         ]);
         curl_multi_add_handle($mh, $ch);

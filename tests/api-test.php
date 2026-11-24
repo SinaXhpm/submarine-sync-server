@@ -195,7 +195,26 @@ check('once full, a sign-up code can\'t finish an account (the code stays usable
     one('SELECT used_at FROM verify_tokens WHERE user_id = ?', [$late])], [403, 'signup_full', null]);
 $inv = mkpending('admin-invited@stage.test');
 $invCode = mktoken($inv, 'invite');
-check('an invitation the admin made still works on a full server', req('GET', '/auth/verify?token=' . $invCode)['code'], 200);
+$r = req('GET', '/auth/verify?token=' . $invCode);
+check('an invitation the admin made still works on a full server', $r['code'], 200);
+$r = req('POST', '/auth/set-password', ['claim_token' => $r['json']['claim_token'] ?? '', 'password' => 'invited full pass 1']);
+check('and its password can be chosen', [$r['code'], one('SELECT status FROM users WHERE id = ?', [$inv])], [200, 'active']);
+// Sign-up codes verified while there was room: their passwords can't all fill it.
+$early = mkpending('verified-early@stage.test');
+$r = req('POST', '/auth/set-password', ['claim_token' => mktoken($early, 'claim'), 'password' => 'early bird pass 1']);
+check('once full, a sign-up\'s claim can\'t choose a password (the account stays unfinished)',
+    [$r['code'], $r['json']['error'] ?? null, one('SELECT status FROM users WHERE id = ?', [$early])], [403, 'signup_full', 'pending']);
+restoreConfig();
+
+// A new sign-up for an unfinished account starts its clean-up time again, so
+// cron doesn't delete it while its fresh code is still valid.
+setConfig(['signup' => 'open', 'mail' => ['transport' => 'smtp', 'smtp_host' => '127.0.0.1', 'smtp_port' => 9, 'smtp_security' => 'none', 'from_address' => 'sync@stage.test']]);
+$back = mkpending('came-back@stage.test');
+$pdo->prepare('UPDATE users SET created_at = NOW() - INTERVAL 8 DAY WHERE id = ?')->execute([$back]);
+clearRL();
+$r = req('POST', '/auth/signup', ['email' => 'came-back@stage.test']);
+check('a repeat sign-up restarts an unfinished account\'s age', [$r['code'],
+    (int) one('SELECT created_at > NOW() - INTERVAL 1 HOUR FROM users WHERE id = ?', [$back])], [200, 1]);
 restoreConfig();
 
 // Email addresses: the plain printable form only.

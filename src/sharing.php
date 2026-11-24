@@ -649,9 +649,14 @@ if ($method === 'POST' && $path === '/shares/set-role') {
     if (!$me || $me['role'] !== 'owner') {
         \Submarine\Lib\Util::sendError(403, 'forbidden', 'only the owner can change roles');
     }
+    // The share's counter first: /shares/sync holds it for a whole exchange,
+    // so one already running ends before this change, and the next sees it.
+    $db->beginTransaction();
+    \Submarine\Lib\SyncDelta::lockForDelete($db, 'shared_revs', ['share_id' => $sid]);
     // `role != owner` guard means the owner's own role can never be demoted.
     $db->prepare('UPDATE profile_members SET role = ? WHERE share_id = ? AND member_user_id = ? AND role != "owner"')
        ->execute([$role, $sid, $target]);
+    $db->commit();
     $audit->log($c['user_id'], $c['email'], $ip, 'share_set_role', true, "share=$sid uid=$target role=$role");
     \Submarine\Lib\Util::sendJson(200, ['ok' => true]);
 }
@@ -671,8 +676,13 @@ if ($method === 'POST' && $path === '/shares/revoke') {
     if ($target === (int) $c['user_id']) {
         \Submarine\Lib\Util::sendError(400, 'invalid_input', 'the owner cannot revoke themselves');
     }
+    // The share's counter first, as in set-role: an exchange already running
+    // ends before the member goes.
+    $db->beginTransaction();
+    \Submarine\Lib\SyncDelta::lockForDelete($db, 'shared_revs', ['share_id' => $sid]);
     $db->prepare('DELETE FROM profile_members WHERE share_id = ? AND member_user_id = ? AND role != "owner"')
        ->execute([$sid, $target]);
+    $db->commit();
     $audit->log($c['user_id'], $c['email'], $ip, 'share_revoke', true, "share=$sid uid=$target");
     \Submarine\Lib\Util::sendJson(200, ['ok' => true]);
 }
@@ -695,12 +705,15 @@ if ($method === 'POST' && $path === '/shares/delete') {
     $db->prepare('DELETE FROM profile_members WHERE share_id = ?')->execute([$sid]);
     $db->prepare('DELETE FROM shared_profiles WHERE share_id = ?')->execute([$sid]);
     $db->prepare('INSERT IGNORE INTO deleted_shares (share_id, deleted_at) VALUES (?, ?)')->execute([$sid, time()]);
-    // Best-effort: drop the synced entities too. Wrapped in its own guard so a
-    // not-yet-created shared_records table (no sync ever ran) isn't fatal.
+    // The synced entities too. Only a missing shared_records table (no sync
+    // ever ran) is let pass: any other error (a deadlock ends the whole
+    // transaction) must not answer "deleted" for a share that is still there.
     try {
         $db->prepare('DELETE FROM shared_records WHERE share_id = ?')->execute([$sid]);
-    } catch (\Throwable $e) {
-        // table may not exist yet — nothing synced; ignore.
+    } catch (\PDOException $e) {
+        if ($e->getCode() !== '42S02') {
+            throw $e;
+        }
     }
     \Submarine\Lib\SyncDelta::forget($db, 'shared_revs', ['share_id' => $sid]);
     $db->commit();
@@ -722,8 +735,12 @@ if ($method === 'POST' && $path === '/shares/leave') {
     if ($me['role'] === 'owner') {
         \Submarine\Lib\Util::sendError(400, 'invalid_input', 'the owner cannot leave; delete or transfer the share');
     }
+    // The share's counter first, as in set-role.
+    $db->beginTransaction();
+    \Submarine\Lib\SyncDelta::lockForDelete($db, 'shared_revs', ['share_id' => $sid]);
     $db->prepare('DELETE FROM profile_members WHERE share_id = ? AND member_user_id = ?')
        ->execute([$sid, $c['user_id']]);
+    $db->commit();
     \Submarine\Lib\Util::sendJson(200, ['ok' => true]);
 }
 

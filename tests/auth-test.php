@@ -183,6 +183,36 @@ check('a spent hour makes no new codes, and keeps the ones already sent', rows('
 check('each of those is logged as held back', (int) one('SELECT COUNT(*) FROM auth_events WHERE event = "mail_suppressed" AND email = ? AND detail = "login_link"', ['mailcap-owner@stage.test']), 3);
 restoreConfig();
 
+section('sign-ups at one moment can\'t spend the part of the hour kept for accounts');
+// They all pass the budget check before any mail is counted; the ones past
+// the sign-up half must not use up the shared budget on their way out.
+$bo = mkuser('burst-owner@stage.test');
+setConfig(array_replace_recursive($mailOn, ['signup' => 'open', 'mail' => ['per_hour' => 4]]));
+clearRL();
+check('five sign-ups at once are answered', race(5, 'POST', '/auth/signup', fn (int $i) => ['email' => "burst$i@stage.test"]), [200, 200, 200, 200, 200]);
+waitFor(fn () => count(array_filter(range(0, 4), fn ($i) => $mailRows("burst$i@stage.test") > 0)) === 5 ? 1 : 0, 30);
+check('two tried, three held back', $kindsOf('burst_@stage.test'), [['mail_failed', 2], ['mail_suppressed', 3]]);
+req('POST', '/auth/request-reset', ['email' => 'burst-owner@stage.test']);
+waitFor(fn () => $mailRows('burst-owner@stage.test') >= 1 ? 1 : 0, 30);
+req('POST', '/auth/request-login', ['email' => 'burst-owner@stage.test']);
+waitFor(fn () => $mailRows('burst-owner@stage.test') >= 2 ? 1 : 0, 30);
+check('the account still gets both its codes', $kindsOf('burst-owner@stage.test'), [['mail_failed', 2]]);
+restoreConfig();
+
+section('sign-ups at one moment don\'t deadlock');
+setConfig($mailOn + ['signup' => 'open']);
+for ($i = 0; $i < 5; $i++) mktoken(mkpending("again$i@stage.test"), 'verify');
+clearRL();
+check('five repeat sign-ups (accounts side by side) at once: all answered',
+    race(5, 'POST', '/auth/signup', fn (int $i) => ['email' => "again$i@stage.test"]), [200, 200, 200, 200, 200]);
+check('each has one code, the new one', (int) one('SELECT COUNT(*) FROM verify_tokens v JOIN users u ON u.id = v.user_id
+    WHERE u.email LIKE "again_@stage.test" AND v.purpose = "verify"'), 5);
+clearRL();
+check('one new address three times at once: all answered', race(3, 'POST', '/auth/signup', ['email' => 'same-moment@stage.test']), [200, 200, 200]);
+check('one account, one code', [(int) one('SELECT COUNT(*) FROM users WHERE email = ?', ['same-moment@stage.test']),
+    (int) one('SELECT COUNT(*) FROM verify_tokens v JOIN users u ON u.id = v.user_id WHERE u.email = ? AND v.purpose = "verify"', ['same-moment@stage.test'])], [1, 1]);
+restoreConfig();
+
 section('limits and their answers');
 setConfig($mailOn + ['signup' => 'open']);
 $codes = [];
@@ -191,6 +221,9 @@ $last = end($codes);
 check('the sixth signup from one address is limited', [$last['code'], $last['json']['error'] ?? null], [429, 'rate_limited']);
 check('the answer names no bucket', $last['json']['message'] ?? null, 'Too many requests, slow down');
 check('Retry-After is sent', header_of($last, 'Retry-After') !== null, true);
+clearRL();
+check('ten sign-ups from one address at once: exactly five pass', race(10, 'POST', '/auth/signup', fn (int $i) => ['email' => "at-once$i@stage.test"]),
+    [200, 200, 200, 200, 200, 429, 429, 429, 429, 429]);
 restoreConfig();
 foreach ([
     ['2001:db8:1:2:3:4:5:6', '2001:db8:1:2::/64'],
@@ -571,6 +604,31 @@ for ($i = 0; $i < 15; $i++) {
 $held = (int) one('SELECT COUNT(*) FROM (SELECT profile FROM sync_records WHERE user_id = ? UNION SELECT profile FROM sync_revs WHERE user_id = ?) h', [$u['id'], $u['id']]);
 check('never more than 10 profiles held, however they were made', $held <= 10, true);
 check('the ones past the cap were refused (507)', in_array(507, $codes, true), true);
+restoreConfig();
+
+section('a counter row alone does not let a new profile past the cap');
+// A push that stores nothing leaves a counter row; the cap is then lowered.
+setConfig(['quota' => ['profiles' => 3]]);
+$u = mkuser('cap-counter@stage.test');
+foreach (['c1', 'c2'] as $p) api($u, 'POST', '/sync', ['profile' => $p, 'since' => '', 'records' => [rec('servers', $now)]]);
+api($u, 'POST', '/sync', ['profile' => 'c3', 'since' => '', 'records' => ['not an object']]);
+$revsOf = fn (string $p): int => (int) one('SELECT COUNT(*) FROM sync_revs WHERE user_id = ? AND profile = ?', [$u['id'], $p]);
+check('the empty push left only a counter', [$revsOf('c3'), (int) one('SELECT COUNT(*) FROM sync_records WHERE user_id = ? AND profile = "c3"', [$u['id']])], [1, 0]);
+setConfig(['quota' => ['profiles' => 2]]);
+$r = api($u, 'POST', '/sync', ['profile' => 'c3', 'since' => '', 'records' => [rec('servers', $now)]]);
+check('records for it are refused at the cap, and its counter goes', [$r['code'], $r['json']['error'] ?? null, $revsOf('c3'),
+    (int) one('SELECT COUNT(DISTINCT profile) FROM sync_records WHERE user_id = ?', [$u['id']])], [507, 'quota_exceeded', 0, 2]);
+
+section('a new profile refused for the quota keeps no counter (no slot is used up)');
+setConfig(['quota' => ['profiles' => 3, 'records' => 3, 'bytes' => 4096]]);
+$u = mkuser('quota-counter@stage.test');
+$r = api($u, 'POST', '/sync', ['profile' => 'rows', 'since' => '', 'records' => array_map(fn () => rec('servers', $now), range(1, 4))]);
+check('too many rows: 507, no counter', [$r['code'], $revsOf('rows')], [507, 0]);
+$r = api($u, 'POST', '/sync', ['profile' => 'bytes', 'since' => '', 'records' => [rec('servers', $now, bin2hex(random_bytes(6000)))]]);
+check('too many bytes: 507, no counter', [$r['code'], $revsOf('bytes')], [507, 0]);
+$codes = [];
+foreach (['n1', 'n2', 'n3'] as $p) $codes[] = api($u, 'POST', '/sync', ['profile' => $p, 'since' => '', 'records' => [rec('servers', $now)]])['code'];
+check('all three profile slots are still free', $codes, [200, 200, 200]);
 restoreConfig();
 
 section('an object with thousands of keys is refused at once; big honest bodies are not');

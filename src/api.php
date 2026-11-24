@@ -76,9 +76,13 @@ $mailBudgetLeft = static function (string $kind) use ($rl, $config, $mailCap): b
 $sendAccountMail = static function (string $kind, int $userId, string $email, callable $send)
     use ($rl, $audit, $config, $ip, $mailCap): void {
     [$bucket, $cap] = $mailCap($kind);
-    $over = $rl->hit('mail:all', 3600) > (int) $config['mail']['per_hour'];
-    if (!$over && $bucket !== null) {
-        $over = $rl->hit($bucket, 3600) > $cap;
+    // The kind's own cap first: a mail over it must not use up the hour's
+    // shared budget too. Many sign-ups at one moment all pass $mailBudgetLeft
+    // before any of them gets here, and would otherwise leave no room for
+    // reset and sign-in codes.
+    $over = $bucket !== null && $rl->hit($bucket, 3600) > $cap;
+    if (!$over) {
+        $over = $rl->hit('mail:all', 3600) > (int) $config['mail']['per_hour'];
     }
     if ($over) {
         $audit->log($userId, $email, $ip, 'mail_suppressed', false, $kind);
@@ -245,30 +249,47 @@ try {
         }
 
         $db->beginTransaction();
+        // The account's row first, made if it isn't there; its lock keeps two
+        // sign-ups for one address apart. (A SELECT ... FOR UPDATE of an
+        // address that isn't there yet locks the gap around it in the email
+        // index instead, and sign-ups for new addresses in the same gap then
+        // deadlock on their inserts.)
+        $make = $db->prepare('INSERT INTO users (email, status) VALUES (?, "pending") ON DUPLICATE KEY UPDATE id = id');
+        $make->execute([$email]);
+        $made = $make->rowCount() === 1; // 0 when the row was there (no CLIENT_FOUND_ROWS)
         $stmt = $db->prepare('SELECT id, status FROM users WHERE email = ? FOR UPDATE');
         $stmt->execute([$email]);
         $existing = $stmt->fetch();
+        if (!$existing) {
+            throw new \RuntimeException('signup: the account row is not there after its insert');
+        }
+        $userId = (int) $existing['id'];
 
         // An active account's signup looks exactly like a new one from
         // outside (the same answer at the same moment, with the same
         // headers), so the endpoint can't be used to find out which addresses
         // have an account. The existing account gets no mail.
-        if ($existing && $existing['status'] === 'active') {
+        if (!$made && $existing['status'] === 'active') {
             $db->rollBack();
-            $audit->log((int) $existing['id'], $email, $ip, 'signup_blocked', false, 'already_active');
+            $audit->log($userId, $email, $ip, 'signup_blocked', false, 'already_active');
             $sameAnswer($answer);
         }
 
-        if ($existing) {
-            $userId = (int) $existing['id'];
-        } else {
-            $db->prepare('INSERT INTO users (email, status) VALUES (?, "pending")')->execute([$email]);
-            $userId = (int) $db->lastInsertId();
+        if (!$made) {
+            // An unfinished account is cleaned up after pending_user_max_age;
+            // a new sign-up starts that time again, so the new code lives.
+            $db->prepare('UPDATE users SET created_at = NOW() WHERE id = ? AND status = "pending"')->execute([$userId]);
+            // Only the newest sign-up code works. An admin's invitation code
+            // (purpose "invite") is left alone, so a stranger signing up with
+            // an invited address can't cancel it. Deleted one by one by their
+            // key: a delete by user_id would lock gaps in that index too.
+            $old = $db->prepare('SELECT token_hash FROM verify_tokens WHERE user_id = ? AND purpose = "verify"');
+            $old->execute([$userId]);
+            $drop = $db->prepare('DELETE FROM verify_tokens WHERE token_hash = ?');
+            foreach ($old->fetchAll(\PDO::FETCH_COLUMN) as $h) {
+                $drop->execute([$h]);
+            }
         }
-        // Only the newest sign-up code works. An admin's invitation code
-        // (purpose "invite") is left alone, so a stranger signing up with an
-        // invited address can't cancel it.
-        $db->prepare('DELETE FROM verify_tokens WHERE user_id = ? AND purpose = "verify"')->execute([$userId]);
         $verifyToken = Util::randomToken(24);
         $db->prepare(
             'INSERT INTO verify_tokens (token_hash, user_id, purpose, expires_at) VALUES (?, ?, "verify", ?)'
@@ -372,6 +393,16 @@ try {
         if ($row['status'] === 'banned') {
             Util::sendError(403, 'account_banned', 'Account suspended');
         }
+        // The cap again: verify checked it, but sign-up codes verified before
+        // any of their passwords was chosen would all have passed it. An
+        // admin's invitation still may (its row stays until this succeeds).
+        if ($fullServer()) {
+            $inv = $db->prepare('SELECT 1 FROM verify_tokens WHERE user_id = ? AND purpose = "invite" LIMIT 1');
+            $inv->execute([$row['user_id']]);
+            if ($inv->fetchColumn() === false) {
+                Util::sendError(403, 'signup_full', 'This server takes no new accounts right now.');
+            }
+        }
 
         $hash = password_hash($password, PASSWORD_DEFAULT);
         $db->beginTransaction();
@@ -450,12 +481,28 @@ try {
                 "Wrong email or password. After several wrong tries, password sign-in pauses for $mins minutes;" . $byMail);
         }
 
+        // The sign-in only while the password is still the one just checked:
+        // a reset or a suspension that landed during the check signs every
+        // device out, and a sign-in made with the old password must not
+        // outlive it. (Both lock this row too, so one of the two goes first.)
+        $db->beginTransaction();
+        $still = $db->prepare('SELECT password_hash, status FROM users WHERE id = ? FOR UPDATE');
+        $still->execute([(int) $row['id']]);
+        $still = $still->fetch();
+        if (!$still || $still['status'] !== 'active'
+            || !hash_equals((string) $row['password_hash'], (string) $still['password_hash'])) {
+            $db->rollBack();
+            $audit->log((int) $row['id'], $email, $ip, 'login_failure', false, 'changed_meanwhile');
+            Util::holdUntil(LOGIN_FAIL_FLOOR_MS);
+            Util::sendError(401, 'invalid_credentials', 'Wrong email or password.');
+        }
         // A hash made at a lower cost is redone at today's, while the password is at hand.
         if (password_needs_rehash((string) $row['password_hash'], PASSWORD_DEFAULT)) {
             $db->prepare('UPDATE users SET password_hash = ? WHERE id = ?')
                ->execute([password_hash($password, PASSWORD_DEFAULT), (int) $row['id']]);
         }
         $authToken = $issueToken((int) $row['id']);
+        $db->commit();
         $auth->clearFailedLogins((int) $row['id'], $ip);
         $audit->log((int) $row['id'], $email, $ip, 'login_success', true);
         Util::sendJson(200, ['token' => $authToken, 'email' => $email]);

@@ -1,6 +1,7 @@
 # Secrets and local settings (only at the top of the repository)
 /.env
 /config.php
+/.submarine-sync.lock
 
 # Editors and OS files
 .idea/

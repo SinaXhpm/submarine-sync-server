@@ -247,7 +247,9 @@ final class Mailer
             if (strlen($line) < 4) {
                 throw new \RuntimeException('the mail server sent an answer that could not be read');
             }
-            if ($line[3] === ' ') break;
+            // "250-..." goes on; "250 ...", and a last line with no text
+            // ("250" alone, RFC 5321 4.2), end the answer.
+            if ($line[3] !== '-') break;
             if (strlen($buf) > 65536) {
                 throw new \RuntimeException('the mail server sent too long an answer');
             }

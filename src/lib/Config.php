@@ -307,6 +307,10 @@ final class Config
                 }
             }
         }
+        // 0 or a word here would hold back every account mail without a sound.
+        if ($m['transport'] !== 'off' && (!is_int($m['per_hour'] ?? null) || $m['per_hour'] < 1)) {
+            $p[] = 'SUBMARINE_MAIL_PER_HOUR must be a whole number, 1 or more.';
+        }
         if ($c['signup'] === 'open' && $m['transport'] === 'off') {
             $p[] = "SUBMARINE_SIGNUP=open needs mail (SUBMARINE_MAIL_TRANSPORT), or nobody gets their code. Use 'invite' without mail.";
         }
@@ -330,6 +334,13 @@ final class Config
             $v = $c['limits'][$k] ?? null;
             if (!is_int($v) || $v < 100 || $v > 10000) {
                 $p[] = "limits.$k must be a number of milliseconds between 100 and 10000.";
+            }
+        }
+        // Each rate limit is [most requests, window in seconds] (config.php).
+        foreach ($c['limits'] as $k => $v) {
+            if (preg_match('/^rate_(ip|email|user)_/', (string) $k)
+                && (!is_array($v) || array_keys($v) !== [0, 1] || !is_int($v[0]) || !is_int($v[1]) || $v[0] < 1 || $v[1] < 1)) {
+                $p[] = "limits.$k must be [most requests, seconds], two whole numbers of 1 or more.";
             }
         }
         foreach (['bytes', 'records', 'profiles', 'shares', 'share_bytes', 'share_records'] as $k) {

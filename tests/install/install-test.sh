@@ -37,7 +37,7 @@ api() { curl -sk --max-time 20 "$@"; }
 code() { api -o /dev/null -w '%{http_code}' "$@"; }
 envv() { sed -n "s/^$1=//p" "$D/.env"; }
 cleanup() {
-    if [ -x "$D/submarine-sync" ]; then "$D/submarine-sync" uninstall --purge --yes >/dev/null 2>&1 || true; fi
+    if [ -x "$D/submarine-sync" ]; then "$D/submarine-sync" uninstall --purge --no-backup --yes >/dev/null 2>&1 || true; fi
     rm -rf "$BK"
     if [ $fails -eq 0 ]; then
         rm -rf "$W" /var/log/submarine-sync-install.log
@@ -121,8 +121,11 @@ is "a backup file" "$([ -f "$B1" ] && echo yes)" yes
 is "a private file in a private folder" "$(stat -c %a "$B1") $(stat -c %a $BK)" "600 700"
 is "it holds db.sql, env and info" "$(tar -tzf "$B1" | sort | tr '\n' ' ')" "db.sql env info "
 is "the dump is complete" "$(tar -xzOf "$B1" db.sql | tail -n 1 | cut -c1-17)" "-- Dump completed"
+# Counted from here: a machine that ran this before keeps the timer's stamp,
+# and enabling the timer again makes the missed daily backup at once.
+n0=$(ls $BK/submarine-sync-*.tar.gz | wc -l)
 systemctl start submarine-sync-backup.service
-is "the timer's service makes one too" "$(ls $BK/submarine-sync-*.tar.gz | wc -l)" 2
+is "the timer's service makes one too" "$(( $(ls $BK/submarine-sync-*.tar.gz | wc -l) - n0 ))" 1
 sleep 1; $SS backup --keep 2 > /dev/null 2>&1
 is "--keep 2 keeps two" "$(ls $BK/submarine-sync-*.tar.gz | wc -l)" 2
 is "the oldest went" "$([ -f "$B1" ] && echo kept || echo gone)" gone
@@ -148,6 +151,9 @@ is "a backup from before the restore" "$(ls $BK/*-before-restore.tar.gz 2>/dev/n
 echo "---- a wrong setting fails fast, check says why, and it comes back"
 setsid -w $SS set SUBMARINE_DB_PASSWORD=x < /dev/null > "$W/s0.log" 2>&1; rc=$?
 is "the database password can't be set here" "$rc $(grep -c 'lock the server out' "$W/s0.log")" "1 1"
+$SS set SUBMARINE_MAIL_FROM_NAME=Team > /dev/null 2>&1
+$SS set "SUBMARINE_MAIL_FROM_NAME=Bob's sync" > /dev/null 2>&1; rc=$?
+is "a value set can't write is refused, and the old one stays" "$rc $(envv SUBMARINE_MAIL_FROM_NAME)" "1 Team"
 $SS set SUBMARINE_SIGNUP=open > /dev/null 2>&1
 t0=$(date +%s); $SS restart > /dev/null 2>&1; rc=$?; took=$(( $(date +%s) - t0 ))
 is "restart with open sign-up and no mail fails" "$rc" 1
@@ -187,8 +193,10 @@ is "again with --email" "$rc" 0
 is "the settings and their secrets are kept" "$([ "$(envv SUBMARINE_TOKEN_PEPPER)" = "$pep" ] && echo same || echo different)" same
 is "the version is kept" "$(git -C $D describe --tags)" v9.0.3
 is "a second invitation" "$(grep -cE '^ +[0-9a-f]{48}$' "$W/install2.log")" 1
-bash "$W/install.sh" --no-https --yes > /dev/null 2>&1; rc=$?
-is "again with --no-https: no Caddy" "$rc $(docker ps -q --filter label=com.docker.compose.service=caddy --filter label=com.docker.compose.project=submarine-sync | wc -l)" "0 0"
+bash "$W/install.sh" --dir /opt/submarine-sync-2 --yes > "$W/install3.log" 2>&1; rc=$?
+is "a second server in another folder is refused" "$rc $(grep -c "installed in $D already" "$W/install3.log") $([ -e /opt/submarine-sync-2 ] && echo made || echo none)" "1 1 none"
+(cd /opt && bash "$W/install.sh" --dir submarine-sync/ --no-https --yes > /dev/null 2>&1); rc=$?
+is "again with --no-https (and a relative --dir): no Caddy" "$rc $(docker ps -q --filter label=com.docker.compose.service=caddy --filter label=com.docker.compose.project=submarine-sync | wc -l)" "0 0"
 is "the server on 127.0.0.1:8080" "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/health)" 200
 bash "$W/install.sh" --domain localhost --yes > /dev/null 2>&1; rc=$?
 is "again with --domain: HTTPS is back" "$rc $(code https://localhost/health)" "0 200"
@@ -196,6 +204,9 @@ is "again with --domain: HTTPS is back" "$rc $(code https://localhost/health)" "
 echo "---- stop, start, uninstall"
 $SS stop > /dev/null 2>&1
 is "stopped" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8080/health)" 000
+$SS restore "$B2" --yes > "$W/r1.log" 2>&1; rc=$?
+is "restore while stopped: the database is started for it" "$rc $(code -H "X-Auth-Token: $TOKEN" https://localhost/sync/profiles)" "0 200"
+$SS stop > /dev/null 2>&1
 $SS start > /dev/null 2>&1
 is "started" "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/health)" 200
 $SS uninstall --yes > /dev/null 2>&1; rc=$?
@@ -204,10 +215,11 @@ is "the data stays" "$(docker volume ls -q | grep -c '^submarine-sync_db$')" 1
 is "the timer is off" "$(systemctl is-enabled submarine-sync-backup.timer 2>&1 | grep -c '^enabled')" 0
 $SS start > /dev/null 2>&1
 is "start again: the data is there" "$(code -H "X-Auth-Token: $TOKEN" https://localhost/sync/profiles)" 200
+$SS stop > /dev/null 2>&1
 $SS uninstall --purge --yes > /dev/null 2>&1; rc=$?
 is "uninstall --purge" "$rc" 0
 is "folder, command and volumes gone" "$([ -e $D ] && echo folder) $([ -e $SS ] && echo command) $(docker volume ls -q | grep -c '^submarine-sync_')" "  0"
-is "a last backup stays" "$(ls $BK/*-before-uninstall.tar.gz 2>/dev/null | wc -l)" 1
+is "a last backup stays (made while stopped)" "$(ls $BK/*-before-uninstall.tar.gz 2>/dev/null | wc -l)" 1
 
 echo
 [ $fails -eq 0 ] && echo "ALL PASS" || echo "$fails FAILED"

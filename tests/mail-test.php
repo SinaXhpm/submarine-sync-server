@@ -26,8 +26,10 @@ register_shutdown_function(function () use (&$servers, $dir) {
 });
 $plainOut = "$dir/plain.jsonl";
 $tlsOut = "$dir/tls.jsonl";
+$bareOut = "$dir/bare.jsonl";
 $start(18125, 'plain', $plainOut);
 $start(18126, 'starttls', $tlsOut);
+$start(18127, 'bare', $bareOut);
 $lines = function (string $f, string $event): array {
     if (!is_file($f)) return [];
     return array_values(array_filter(array_map(fn ($l) => json_decode($l, true), file($f, FILE_IGNORE_NEW_LINES)), fn ($m) => ($m['event'] ?? '') === $event));
@@ -98,6 +100,14 @@ clearRL();
 req('POST', '/auth/signup', ['email' => 'four@stage.test']);
 $msg = waitFor(fn () => count($lines($plainOut, 'message')) >= 2 ? $lines($plainOut, 'message') : [], 10);
 check('with no user name, no sign-in is tried', [count($msg), array_key_exists('auth', $msg[1] ?? []) ? $msg[1]['auth'] : 'missing'], [2, null]);
+
+section('a server whose answers end with the code alone');
+setConfig($smtp(18127, 'none'));
+clearRL();
+req('POST', '/auth/signup', ['email' => 'bare@stage.test']);
+$msg = waitFor(fn () => $lines($bareOut, 'message'), 15);
+check('the mail is sent, signed in, and nothing is logged as failed', [count($msg), $msg[0]['auth'] ?? null,
+    (int) one("SELECT COUNT(*) FROM auth_events WHERE event = 'mail_failed' AND email = 'bare@stage.test'")], [1, ['mailer', 'mail secret 1'], 0]);
 
 section('a first sharing key: the owner hears about it');
 setConfig($smtp(18125, 'none'));

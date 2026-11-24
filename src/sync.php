@@ -98,6 +98,13 @@ if ($records) {
 // locked inside it for the whole exchange (src/lib/SyncDelta.php).
 $partition = ['user_id' => $c['user_id'], 'profile' => $profile];
 SyncDelta::ensure($db, 'sync_revs', 'sync_records', $partition, (bool) $records);
+// After a rollback: the counter row made above goes again while the profile
+// has no records, so it doesn't hold a profile slot that no list shows.
+$dropEmptyCounter = static function () use ($db, $c, $profile): void {
+    $db->prepare('DELETE FROM sync_revs WHERE user_id = ? AND profile = ?
+                   AND NOT EXISTS (SELECT 1 FROM sync_records WHERE user_id = ? AND profile = ?)')
+       ->execute([$c['user_id'], $profile, $c['user_id'], $profile]);
+};
 
 $db->beginTransaction();
 // The account's row first: one exchange per account at a time, so two pushes
@@ -110,20 +117,24 @@ if ($lockMe->fetchColumn() === false) {
     // The account was deleted while this request waited: nothing of this
     // exchange stays, the counter row made above included.
     $db->rollBack();
-    $db->prepare('DELETE FROM sync_revs WHERE user_id = ? AND profile = ?
-                   AND NOT EXISTS (SELECT 1 FROM sync_records WHERE user_id = ? AND profile = ?)')
-       ->execute([$c['user_id'], $profile, $c['user_id'], $profile]);
+    $dropEmptyCounter();
     Util::sendError(401, 'invalid_token', 'Unknown token');
 }
-// Under the lock, profiles with records only: pushes running at the same
-// moment have made their counter rows already, before their own transaction.
+// Under the lock, the cap again, for any profile that holds no records yet:
+// "new" is decided again here, because a counter row alone (made by a push
+// that stored nothing) made it look known above. The others are counted by
+// their records only: pushes running at the same moment have made their
+// counter rows already, before their own transaction.
+if ($records) {
+    $hasRows = $db->prepare('SELECT 1 FROM sync_records WHERE user_id = ? AND profile = ? LIMIT 1');
+    $hasRows->execute([$c['user_id'], $profile]);
+    $isNew = $hasRows->fetchColumn() === false;
+}
 if ($isNew && $heldOthers(false) >= $MAX_PROFILES) {
     // Another push made a profile while this one waited. This one's counter
     // row, made above, goes again so it doesn't count as held.
     $db->rollBack();
-    $db->prepare('DELETE FROM sync_revs WHERE user_id = ? AND profile = ?
-                   AND NOT EXISTS (SELECT 1 FROM sync_records WHERE user_id = ? AND profile = ?)')
-       ->execute([$c['user_id'], $profile, $c['user_id'], $profile]);
+    $dropEmptyCounter();
     $audit->log($c['user_id'], $c['email'], $ip, 'sync', false, "profile=$profile too_many_profiles");
     Util::sendError(507, 'quota_exceeded',
         "Cloud profile limit reached ($MAX_PROFILES per account). Delete a profile from the cloud, then sync again.");
@@ -183,12 +194,14 @@ $usedQ->execute([$c['user_id']]);
 $usedAfter = $usedQ->fetch();
 if ((int) $usedAfter['n'] > $MAX_ROWS && (int) $usedAfter['n'] > (int) $usedBefore['n']) {
     $db->rollBack();
+    $dropEmptyCounter();
     $audit->log($c['user_id'], $c['email'], $ip, 'sync', false, "profile=$profile too_many_rows");
     Util::sendError(507, 'quota_exceeded',
         "Cloud record limit reached ($MAX_ROWS per account). Delete a profile from the cloud, then sync again.");
 }
 if (intdiv((int) $usedAfter['hex'], 2) > $QUOTA_BYTES && (int) $usedAfter['hex'] > (int) $usedBefore['hex']) {
     $db->rollBack();
+    $dropEmptyCounter();
     $audit->log($c['user_id'], $c['email'], $ip, 'sync', false, "profile=$profile quota_exceeded");
     Util::sendError(507, 'quota_exceeded',
         "Cloud storage limit reached ($quotaText per account). Remove some items, or delete a profile from the cloud, then sync again.");

@@ -37,7 +37,9 @@ ENV SUBMARINE_IN_DOCKER=1
 
 USER www-data
 EXPOSE 8080
+# Under SUBMARINE_BASE_PATH when one is set (without the trailing slashes the
+# server drops too), or /health answers 404 and the app counts as unhealthy.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
-    CMD curl -fsS -o /dev/null http://127.0.0.1:8080/health || exit 1
+    CMD curl -fsS -o /dev/null "http://127.0.0.1:8080$(printf '%s' "${SUBMARINE_BASE_PATH:-}" | sed 's#[[:space:]/]*$##; s#^[[:space:]]*##')/health" || exit 1
 ENTRYPOINT ["submarine-entrypoint"]
 CMD ["apache2-foreground"]

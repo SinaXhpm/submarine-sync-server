@@ -19,14 +19,15 @@ final class RateLimit
     /** Count one hit in the bucket's current window; returns the new count. */
     public function hit(string $bucket, int $windowSeconds): int
     {
-        $windowStart = $this->windowStart($windowSeconds);
+        // The count this hit made, read in the same statement (LAST_INSERT_ID
+        // is per connection). Read again after it, it would include hits made
+        // meanwhile, and at one moment all of them could see themselves past
+        // the limit.
         $this->db->prepare(
-            'INSERT INTO rate_limits (bucket, window_start, hits) VALUES (?, ?, 1)
-             ON DUPLICATE KEY UPDATE hits = hits + 1'
-        )->execute([$this->key($bucket), $windowStart]);
-        $st = $this->db->prepare('SELECT hits FROM rate_limits WHERE bucket = ? AND window_start = ?');
-        $st->execute([$this->key($bucket), $windowStart]);
-        return (int) ($st->fetchColumn() ?: 0);
+            'INSERT INTO rate_limits (bucket, window_start, hits) VALUES (?, ?, LAST_INSERT_ID(1))
+             ON DUPLICATE KEY UPDATE hits = LAST_INSERT_ID(hits + 1)'
+        )->execute([$this->key($bucket), $this->windowStart($windowSeconds)]);
+        return (int) $this->db->query('SELECT LAST_INSERT_ID()')->fetchColumn();
     }
 
     /** Count a hit; past `max` in the window, answer 429 and stop. */

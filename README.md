@@ -101,7 +101,7 @@ sudo submarine-sync help                         # everything else
 | `edit` | Open `.env` in an editor, then restart. |
 | `admin-password` | Switch the [web admin panel](#the-web-admin-panel) on or give it a new password; `--generate` makes one, `--off` switches the panel off. |
 | `backup`, `backups`, `restore <file>` | See [Backups and upgrades](#backups-and-upgrades). |
-| `uninstall` | Stop and remove the containers; the data stays, and `start` brings it back. `--purge` also removes the data and the folder, after a last backup. |
+| `uninstall` | Stop and remove the containers; the data stays, and `start` brings it back. `--purge` also removes the data and the folder, after a last backup (`--purge --no-backup`: without one). |
 
 It works for a server you [set up by hand](#install-by-hand-with-docker) too: run `sudo ./submarine-sync` in its folder. If you started that one with `docker compose --profile https`, put `COMPOSE_PROFILES=https` in its `.env` first, so the command starts Caddy too. Or run `sudo ./install.sh --domain sync.example.com` in that folder: it keeps the settings and the data, and adds the rest.
 
@@ -149,6 +149,17 @@ docker compose up -d
 (`COMPOSE_PROFILES=https` does what `docker compose --profile https ...` does, for every command.) The sync server address for the app is then `https://sync.example.com`.
 
 **Your own reverse proxy instead** (nginx, Traefik, another Caddy): send it to the app container's port (`127.0.0.1:8080` by default), and tell the server to believe that proxy about the client's address, or every user shares its rate limits. Requests from a proxy on the host reach the container from Docker's network gateway, not from 127.0.0.1, so set `SUBMARINE_TRUSTED_PROXIES` to that network, for example `172.16.0.0/12` (`docker network inspect submarine-sync_default` shows the exact gateway). `php bin/admin.php check` lists the addresses the server saw in the last hour: if nearly everything comes from one private address, that is the proxy and it isn't trusted yet. See [Settings](#settings).
+
+The proxy must also pass on the client's address and the original host name; nginx does neither by default:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
 
 **IPv6.** If the domain also has an AAAA record, devices that connect over IPv6 work, but Docker passes their connections on through a proxy of its own, so the server sees that proxy's address for all of them, and they share one set of rate limits (`submarine-sync check` then lists a `172.x.x.1` address). With Docker 27 or newer, Docker's network can get IPv6 too, and they keep their own addresses:
 

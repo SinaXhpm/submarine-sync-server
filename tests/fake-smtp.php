@@ -6,6 +6,8 @@
 //
 // plain:    STARTTLS is not offered.
 // starttls: STARTTLS is offered (cert.pem holds a certificate and its key).
+// bare:     like plain, but every answer ends with a line that is the code
+//           alone ("250-ok", then "250"), which RFC 5321 4.2 allows.
 declare(strict_types=1);
 
 [$_, $port, $mode, $outfile] = $argv + [null, null, null, null];
@@ -23,7 +25,7 @@ while (true) {
     if (!$c) continue;
     stream_set_timeout($c, 10);
     $msg = ['tls' => false, 'auth' => null, 'auth_before_tls' => false, 'from' => null, 'to' => [], 'data' => null];
-    $say = fn (string $s) => fwrite($c, $s . "\r\n");
+    $say = fn (string $s) => fwrite($c, ($mode === 'bare' ? preg_replace('/^(\d{3}) (.*)$/', "\$1-\$2\r\n\$1", $s) : $s) . "\r\n");
     $say('220 fake.test ESMTP');
     while (($line = fgets($c, 8192)) !== false) {
         $cmd = rtrim($line, "\r\n");

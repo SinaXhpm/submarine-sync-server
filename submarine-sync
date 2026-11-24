@@ -14,8 +14,10 @@ umask 022
 
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 DIR=$(readlink -f "${SUBMARINE_DIR:-$(dirname "$SELF")}")
-LOCK=/run/lock/submarine-sync.lock
-[ -d /run/lock ] || LOCK=/tmp/submarine-sync.lock
+# In root's own /run: in a folder anyone may write to (/run/lock, /tmp), any
+# local user could make or hold the file and stop backups and updates.
+LOCK=/run/submarine-sync.lock
+[ -w /run ] || LOCK="$DIR/.submarine-sync.lock"
 BACKUP_MADE=
 
 # Temporary files and folders go when the command ends, however it ends.
@@ -64,7 +66,8 @@ Backups (the database and .env, in SUBMARINE_BACKUP_DIR)
   restore <file>       Put the database of a backup back (asks first).
 
   uninstall [--purge]  Stop and remove the containers; --purge also removes
-                       the data and this folder (after a last backup).
+                       the data and this folder (after a last backup; it
+                       stops if none can be made, unless --no-backup).
 TXT
 }
 
@@ -121,8 +124,10 @@ env_set() {
 backup_dir() { local d; d=$(env_get SUBMARINE_BACKUP_DIR); printf '%s' "${d:-/var/backups/submarine-sync}"; }
 https_on()   { [[ ,$(env_get COMPOSE_PROFILES), == *,https,* ]] && [ -n "$(env_get SUBMARINE_DOMAIN)" ]; }
 local_port() { local p; p=$(env_get SUBMARINE_HTTP_PORT); printf '%s' "${p:-8080}"; }
+# The base path as the server uses it (no spaces around it, no trailing slashes).
+base_path()  { env_get SUBMARINE_BASE_PATH | sed 's#[[:space:]/]*$##; s#^[[:space:]]*##'; }
 address()    {
-    local base; base=$(env_get SUBMARINE_BASE_PATH); base=${base%/}
+    local base; base=$(base_path)
     if https_on; then printf 'https://%s%s' "$(env_get SUBMARINE_DOMAIN)" "$base"
     else printf 'http://127.0.0.1:%s%s' "$(local_port)" "$base"; fi
 }
@@ -169,12 +174,25 @@ wait_healthy() {
     return 1
 }
 
+# Start the database when it isn't running, and wait until it takes
+# connections (a backup needs that; "starting" isn't enough).
+db_up() {
+    local until=$(( $(date +%s) + 120 ))
+    case "$(state_of db)" in healthy|running) return 0 ;; esac
+    dc up -d db || return 1
+    while [ "$(date +%s)" -lt "$until" ]; do
+        case "$(state_of db)" in healthy|running) return 0 ;; unhealthy|exited|dead) return 1 ;; esac
+        sleep 2
+    done
+    return 1
+}
+
 # Whether https://<domain>/health answers through Caddy on this machine, with
 # a certificate this machine trusts (not for "localhost": Caddy's own CA).
 https_answers() {
     local d=$1 k=()
     [ "$d" = localhost ] && k=(-k)
-    curl -fsS ${k[@]+"${k[@]}"} --max-time 8 -o /dev/null --resolve "$d:443:127.0.0.1" "https://$d$(env_get SUBMARINE_BASE_PATH)/health" 2>/dev/null
+    curl -fsS ${k[@]+"${k[@]}"} --max-time 8 -o /dev/null --resolve "$d:443:127.0.0.1" "https://$d$(base_path)/health" 2>/dev/null
 }
 
 # Wait for HTTPS. Returns 3 when it doesn't come, after saying why it may not.
@@ -231,7 +249,7 @@ cmd_status() {
     echo
     dc ps --all --format 'table {{.Service}}\t{{.State}}\t{{.Status}}' 2>/dev/null || dc ps --all
     echo
-    if curl -fsS --max-time 5 -o /dev/null "http://127.0.0.1:$(local_port)$(env_get SUBMARINE_BASE_PATH)/health" 2>/dev/null; then
+    if curl -fsS --max-time 5 -o /dev/null "http://127.0.0.1:$(local_port)$(base_path)/health" 2>/dev/null; then
         echo "Server:   answers on 127.0.0.1:$(local_port)"
     else
         echo "Server:   NO ANSWER on 127.0.0.1:$(local_port) (submarine-sync logs app)"
@@ -307,7 +325,7 @@ cmd_admin() {  # bin/admin.php in the app container
 
 cmd_set() {
     [ $# -gt 0 ] || die "Say what to set, for example: submarine-sync set SUBMARINE_SIGNUP=open"
-    local a k v
+    local a k v q
     for a in "$@"; do
         [[ $a == *=* ]] || die "Write it as NAME=VALUE: $a"
         k=${a%%=*}; v=${a#*=}
@@ -317,7 +335,10 @@ cmd_set() {
             SUBMARINE_TOKEN_PEPPER)
                 warn "A new token pepper signs every device out." ;;
         esac
-        env_set "$k" "$(env_quote "$v")"
+        # Not env_set "$k" "$(env_quote ...)": a refused value would only end
+        # the $( ), and an empty one would be written.
+        q=$(env_quote "$v")
+        env_set "$k" "$q"
         info "$k set."
     done
     info "Run submarine-sync restart to use the new settings."
@@ -384,7 +405,7 @@ cmd_admin_password() {
     if https_on; then
         info "Address:  $(address)$path"
     else
-        info "Address:  http://127.0.0.1:$(local_port)$(env_get SUBMARINE_BASE_PATH)$path"
+        info "Address:  http://127.0.0.1:$(local_port)$(base_path)$path"
         info "It needs HTTPS. For a browser on this machine (or through an SSH tunnel):"
         info "submarine-sync set SUBMARINE_ADMIN_ALLOW_HTTP_LOCAL=1, then submarine-sync restart"
     fi
@@ -416,7 +437,9 @@ cmd_backup() {
     # Everything of a backup is private from the first byte (it holds .env).
     local um; um=$(umask)
     umask 077
-    install -d -m 700 "$bdir"
+    # A folder that is there already keeps its mode (it may be a shared mount):
+    # the backups in it are private files of their own.
+    [ -d "$bdir" ] || install -d -m 700 "$bdir"
     ts=$(date -u +%Y%m%d-%H%M%S)
     name="submarine-sync-$ts${tag:+-$tag}.tar.gz"
     tmp=$(mktemp -d "$bdir/.part-XXXXXX")
@@ -472,9 +495,14 @@ cmd_restore() {
     tar -C "$tmp" -xzf "$file" db.sql
     [ "$(tail -n 1 "$tmp/db.sql" | cut -c1-17)" = '-- Dump completed' ] || die "The database dump in $file is incomplete."
     ver=$(tar -xzOf "$file" info 2>/dev/null | sed -n 's/^version=//p' || true)
+    # Sign-ins and codes in that database are only good with the token pepper
+    # they were made with. Read (and checked) before anything changes.
+    pep=$(unquote "$(tar -xzOf "$file" env 2>/dev/null | sed -n 's/^SUBMARINE_TOKEN_PEPPER=//p' | sed -n '$p' || true)")
+    cur=$(env_get SUBMARINE_TOKEN_PEPPER)
+    if [ -n "$pep" ] && [ "$pep" != "$cur" ]; then pep=$(env_quote "$pep"); else pep=''; fi
     [ $yes = 1 ] || confirm "This replaces the server's database with the one in $file${ver:+ (made by $ver)}. Everything since then is lost." restore
     take_lock
-    case "$(state_of db)" in healthy|running) ;; *) dc up -d db; sleep 5 ;; esac
+    db_up || die "The database doesn't start (submarine-sync logs db). Nothing changed."
     say "A backup of the database as it is now, first"
     cmd_backup --tag before-restore
     local safety=$BACKUP_MADE
@@ -484,12 +512,8 @@ cmd_restore() {
         dc up -d >/dev/null 2>&1 || true
         die "The restore failed. The database as it was is in $safety (submarine-sync restore $safety)."
     fi
-    # Sign-ins and codes in that database are only good with the token pepper
-    # they were made with.
-    pep=$(unquote "$(tar -xzOf "$file" env 2>/dev/null | sed -n 's/^SUBMARINE_TOKEN_PEPPER=//p' | sed -n '$p' || true)")
-    cur=$(env_get SUBMARINE_TOKEN_PEPPER)
-    if [ -n "$pep" ] && [ "$pep" != "$cur" ]; then
-        env_set SUBMARINE_TOKEN_PEPPER "$(env_quote "$pep")"
+    if [ -n "$pep" ]; then
+        env_set SUBMARINE_TOKEN_PEPPER "$pep"
         info "The token pepper of the backup is back in .env too, so its sign-ins keep working."
     fi
     dc up -d --remove-orphans
@@ -554,10 +578,11 @@ cmd_update() {
 
 cmd_uninstall() {
     need_docker
-    local purge=0 yes=0 bdir
+    local purge=0 yes=0 nobackup=0 bdir
     while [ $# -gt 0 ]; do
         case "$1" in
             --purge) purge=1 ;;
+            --no-backup) nobackup=1 ;;
             --yes) yes=1 ;;
             *) die "Unknown option: $1" ;;
         esac
@@ -573,8 +598,16 @@ cmd_uninstall() {
         info "Stopped. The data is kept: submarine-sync start brings it back; submarine-sync uninstall --purge removes all."
         return 0
     fi
-    [ $yes = 1 ] || confirm "This deletes the server's database, its settings and $DIR from this machine. A last backup goes to $bdir first." DELETE
-    case "$(state_of db)" in healthy|running) cmd_backup --tag before-uninstall ;; *) warn "The database isn't running: no last backup." ;; esac
+    if [ $nobackup = 1 ]; then
+        [ $yes = 1 ] || confirm "This deletes the server's database, its settings and $DIR from this machine, with NO last backup." DELETE
+    else
+        [ $yes = 1 ] || confirm "This deletes the server's database, its settings and $DIR from this machine. A last backup goes to $bdir first." DELETE
+        # The database may be stopped (submarine-sync stop, or uninstall
+        # without --purge first): it is started for the backup. Without a
+        # backup nothing is deleted.
+        db_up || die "The database doesn't start, so there is no last backup; nothing was removed. To remove it all without one: submarine-sync uninstall --purge --no-backup"
+        cmd_backup --tag before-uninstall
+    fi
     dc --profile https down --volumes --remove-orphans --rmi local
     timer_off
     if [ "$(readlink -f /usr/local/bin/submarine-sync 2>/dev/null || true)" = "$SELF" ]; then rm -f /usr/local/bin/submarine-sync; fi

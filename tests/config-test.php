@@ -99,5 +99,29 @@ foreach (['SUBMARINE_DB_PASSWORD', 'SUBMARINE_TOKEN_PEPPER', 'SUBMARINE_SIGNUP',
     check(".env.example mentions $n", str_contains($env, "$n="), true);
 }
 
+// problems(): a mail cap of 0 and a broken rate pair are named, not silently used.
+putenv('SUBMARINE_TOKEN_PEPPER=' . str_repeat('cd', 20));
+putenv('SUBMARINE_MAIL_TRANSPORT=smtp');
+putenv('SUBMARINE_MAIL_FROM=a@b.example');
+putenv('SUBMARINE_SMTP_HOST=smtp.example');
+$c = Config::load(__DIR__ . '/..');
+check('the base settings have no problems', Config::problems($c), []);
+$has = fn (array $c, string $needle): bool => (bool) array_filter(Config::problems($c), fn ($s) => str_contains($s, $needle));
+foreach ([0, -3, '5'] as $bad) {
+    $x = $c;
+    $x['mail']['per_hour'] = $bad;
+    check('mail per_hour ' . json_encode($bad) . ' is a problem', $has($x, 'SUBMARINE_MAIL_PER_HOUR'), true);
+}
+$x = $c;
+$x['mail']['per_hour'] = 0;
+$x['mail']['transport'] = 'off';
+check('with mail off, per_hour does not matter', $has($x, 'SUBMARINE_MAIL_PER_HOUR'), false);
+foreach ([[0, 60], [5], [5, '60'], ['a' => 5, 'b' => 60], 5, [5, 0]] as $bad) {
+    $x = $c;
+    $x['limits']['rate_ip_login'] = $bad;
+    check('rate pair ' . json_encode($bad) . ' is a problem', $has($x, 'limits.rate_ip_login'), true);
+}
+foreach (['SUBMARINE_TOKEN_PEPPER', 'SUBMARINE_MAIL_TRANSPORT', 'SUBMARINE_MAIL_FROM', 'SUBMARINE_SMTP_HOST'] as $n) putenv($n);
+
 echo $fails ? "$fails FAILED\n" : "ALL PASS\n";
 exit($fails ? 1 : 0);
