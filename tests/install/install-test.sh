@@ -98,6 +98,8 @@ api -c "$W/jar" -o /dev/null --data-urlencode do=login --data-urlencode "passwor
 is "signed in with the printed password" "$(api -b "$W/jar" "$ADMIN_URL" | grep -c 'Invite someone')" 1
 $SS admin-password --off > /dev/null 2>&1
 is "admin-password --off: the panel is gone" "$(code "$ADMIN_URL")" 404
+out=$($SS admin-password --path 2>&1); rc=$?
+is "admin-password --path with no path: says so, and the panel stays off" "$rc $(printf '%s' "$out" | grep -c -- '--path needs a value') $(code "$ADMIN_URL")" "1 1 404"
 
 echo "---- files a strict umask (027, 077) made private still work in the image"
 chmod -R go-rwx "$D/public" "$D/src" "$D/bin" "$D/docker"
@@ -129,6 +131,8 @@ is "the timer's service makes one too" "$(( $(ls $BK/submarine-sync-*.tar.gz | w
 sleep 1; $SS backup --keep 2 > /dev/null 2>&1
 is "--keep 2 keeps two" "$(ls $BK/submarine-sync-*.tar.gz | wc -l)" 2
 is "the oldest went" "$([ -f "$B1" ] && echo kept || echo gone)" gone
+out=$($SS backup --keep 2>&1); rc=$?
+is "--keep with no number: says so, makes no backup" "$rc $(printf '%s' "$out" | grep -c -- '--keep needs a value') $(ls $BK/submarine-sync-*.tar.gz | wc -l)" "1 1 2"
 $SS backup > "$W/b2.log" 2>&1
 B2=$(sed -n 's/^ *Backup: \([^ ]*\) .*/\1/p' "$W/b2.log")
 

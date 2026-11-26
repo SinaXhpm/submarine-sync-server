@@ -30,6 +30,8 @@ say()  { printf '%s==> %s%s\n' "$B" "$*" "$N"; }
 info() { printf '    %s\n' "$*"; }
 warn() { printf '%s!!  %s%s\n' "$Y" "$*" "$N" >&2; }
 die()  { printf '%sError: %s%s\n' "$R" "$*" "$N" >&2; exit 1; }
+# An option that takes a value has one: not the end of the line, not another option.
+need_value() { [ $# -ge 2 ] && [ -n "$2" ] && [ "${2#--}" = "$2" ] || die "$1 needs a value (see: submarine-sync help)."; }
 
 usage() {
     cat <<'TXT'
@@ -363,7 +365,7 @@ cmd_admin_password() {
         case "$1" in
             --generate) gen=1 ;;
             --off) off=1 ;;
-            --path) path=${2:-}; shift ;;
+            --path) need_value "$@"; path=$2; shift ;;
             --path=*) path=${1#*=} ;;
             *) die "Unknown option: $1" ;;
         esac
@@ -420,10 +422,10 @@ cmd_backup() {
     local keep='' quiet=0 tag='' bdir tmp ts name
     while [ $# -gt 0 ]; do
         case "$1" in
-            --keep) keep=${2:-}; shift ;;
+            --keep) need_value "$@"; keep=$2; shift ;;
             --keep=*) keep=${1#*=} ;;
             --quiet) quiet=1 ;;
-            --tag) tag=${2:-}; shift ;;
+            --tag) need_value "$@"; tag=$2; shift ;;
             *) die "Unknown option: $1" ;;
         esac
         shift

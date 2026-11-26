@@ -66,25 +66,35 @@ final class Admin
         $ttl = (int) $this->config['limits']['invite_token_ttl'];
         $this->db->beginTransaction();
         try {
+            // The account's row first, made if it isn't there, then its lock
+            // (as a sign-up does, src/api.php). A SELECT ... FOR UPDATE of an
+            // address that isn't there yet locks the gap around it in the
+            // email index instead, and invitations for new addresses in the
+            // same gap then deadlock on their inserts.
+            $this->db->prepare('INSERT INTO users (email, status) VALUES (?, "pending") ON DUPLICATE KEY UPDATE id = id')->execute([$email]);
             $st = $this->db->prepare('SELECT id, status FROM users WHERE email = ? FOR UPDATE');
             $st->execute([$email]);
             $row = $st->fetch();
-            if ($row && $row['status'] === 'active') {
+            if (!$row) {
+                throw new \RuntimeException('invite: the account row is not there after its insert');
+            }
+            if ($row['status'] === 'active') {
                 throw new InvalidArgumentException("$email already has an account. To let them set a new password, make a reset code.");
             }
-            if ($row && $row['status'] === 'banned') {
+            if ($row['status'] === 'banned') {
                 throw new InvalidArgumentException("$email is suspended. Unsuspend it first.");
             }
-            if ($row) {
-                $uid = (int) $row['id'];
-            } else {
-                $this->db->prepare('INSERT INTO users (email, status) VALUES (?, "pending")')->execute([$email]);
-                $uid = (int) $this->db->lastInsertId();
-            }
+            $uid = (int) $row['id'];
             // Only the newest invitation works. It is a code of its own kind
             // ("invite"), so a sign-up with the same address (open sign-up)
-            // doesn't cancel it.
-            $this->db->prepare('DELETE FROM verify_tokens WHERE user_id = ? AND purpose = "invite"')->execute([$uid]);
+            // doesn't cancel it. Deleted one by one by their key: a delete by
+            // user_id would lock gaps in that index too.
+            $old = $this->db->prepare('SELECT token_hash FROM verify_tokens WHERE user_id = ? AND purpose = "invite"');
+            $old->execute([$uid]);
+            $drop = $this->db->prepare('DELETE FROM verify_tokens WHERE token_hash = ?');
+            foreach ($old->fetchAll(PDO::FETCH_COLUMN) as $h) {
+                $drop->execute([$h]);
+            }
             // A pending account is cleaned up after pending_user_max_age; an
             // invitation starts that time again.
             $this->db->prepare('UPDATE users SET created_at = NOW() WHERE id = ?')->execute([$uid]);

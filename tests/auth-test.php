@@ -674,9 +674,20 @@ api($v, 'POST', '/shares/create', ['share_id' => $theirs, 'name' => 'TheirShare'
 api($v, 'POST', '/shares/invite', ['share_id' => $theirs, 'email' => 'del1@stage.test', 'role' => 'editor', 'sealed_dek' => 'ab']);
 api($v, 'POST', '/shares/sync', ['share_id' => $theirs, 'since' => '', 'records' => [rec('servers', $now), rec('servers', $now + 1)]]);
 $pdo->prepare('UPDATE shared_records SET last_writer = ? WHERE share_id = ? LIMIT 1')->execute([$u['id'], $theirs]);
+// Log rows that name the address but no account, as the server writes them
+// for a mail that failed and for a sign-in tried before the account was
+// there. And one for another address, which must stay.
+$ev = $pdo->prepare('INSERT INTO auth_events (user_id, email, ip_address, event, success, detail, created_at) VALUES (NULL, ?, "127.0.0.1", ?, 0, ?, ?)');
+$ev->execute(['del1@stage.test', 'mail_failed', 'no connection', time()]);
+$ev->execute(['del1@stage.test', 'login_failure', 'no_such_user', time() - 3600]);
+$ev->execute(['del-member@stage.test', 'mail_failed', 'no connection', time()]);
 clearRL();
 $r = api($u, 'POST', '/auth/delete-account', ['password' => 'right password 1']);
 check('the right password: 200 ok', [$r['code'], $r['json']['ok'] ?? null], [200, true]);
+check('no log row names the address any more; another address\'s row stays', [
+    (int) one('SELECT COUNT(*) FROM auth_events WHERE email = ?', ['del1@stage.test']),
+    (int) one("SELECT COUNT(*) FROM auth_events WHERE email = ? AND user_id IS NULL AND event = 'mail_failed'", ['del-member@stage.test']),
+], [0, 1]);
 $left = [];
 foreach (['sync_records', 'sync_revs', 'sync_profiles', 'user_keys', 'auth_tokens', 'auth_events'] as $t) {
     $left[$t] = (int) one("SELECT COUNT(*) FROM `$t` WHERE user_id = ?", [$u['id']]);

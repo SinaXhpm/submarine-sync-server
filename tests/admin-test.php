@@ -129,6 +129,56 @@ $x = req('POST', '/auth/reset-with-token', ['reset_token' => $m[1] ?? '', 'passw
 check('it resets the password', $x['code'], 200);
 check('the code is not stored in clear', (int) one('SELECT COUNT(*) FROM verify_tokens WHERE token_hash = ?', [$m[1] ?? '']), 0);
 
+section('invitations at one moment: no deadlock');
+/** Invitations through the panel at once; [status codes, how many pages show a code]. */
+function invitesAtOnce(array $emails): array
+{
+    global $jar, $panelPath, $csrf;
+    $mh = curl_multi_init();
+    $hs = [];
+    foreach ($emails as $e) {
+        $ch = curl_init(BASE . $panelPath);
+        curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 60, CURLOPT_HTTPHEADER => ['Cookie: ' . $jar],
+            CURLOPT_POSTFIELDS => http_build_query(['do' => 'invite', 'csrf' => $csrf, 'email' => $e])]);
+        curl_multi_add_handle($mh, $ch);
+        $hs[] = $ch;
+    }
+    do { curl_multi_exec($mh, $running); if ($running) curl_multi_select($mh, 1.0); } while ($running);
+    $codes = [];
+    $shown = 0;
+    foreach ($hs as $ch) {
+        $codes[] = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $shown += preg_match('/<div class="code">[0-9a-f]{48}<\/div>/', (string) curl_multi_getcontent($ch));
+    }
+    sort($codes);
+    return [$codes, $shown];
+}
+$invited = fn (string $like) => [
+    (int) one('SELECT COUNT(*) FROM users WHERE email LIKE ? AND status = "pending"', [$like]),
+    (int) one('SELECT COUNT(*) FROM verify_tokens v JOIN users u ON u.id = v.user_id WHERE u.email LIKE ? AND v.purpose = "invite"', [$like]),
+];
+$all = [];
+foreach (range(1, 3) as $round) {
+    $all[] = invitesAtOnce(array_map(fn ($i) => "crowd-$round-$i@stage.test", range(1, 6)));
+}
+check('the panel, six new addresses at once, three rounds: a code for each', $all, array_fill(0, 3, [array_fill(0, 6, 200), 6]));
+check('18 pending accounts, one invitation code each', $invited('crowd-%'), [18, 18]);
+check('one new address three times at once: a code each time', invitesAtOnce(array_fill(0, 3, 'thrice@stage.test')), [[200, 200, 200], 3]);
+check('one account, and only the newest code is left', $invited('thrice@stage.test'), [1, 1]);
+$procs = [];
+foreach (range(1, 8) as $i) {
+    $p = proc_open([PHP_BINARY, ROOT . '/bin/admin.php', 'invite', "many-$i@stage.test"], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+    $procs[] = [$p, $pipes];
+}
+$rcs = [];
+foreach ($procs as [$p, $pipes]) {
+    stream_get_contents($pipes[1]);
+    $err = trim((string) stream_get_contents($pipes[2]));
+    if ($err !== '') echo 'invite stderr: ' . substr($err, 0, 200) . "\n";
+    $rcs[] = proc_close($p);
+}
+check('the command line, eight at once: all succeed', [$rcs, $invited('many-%')], [array_fill(0, 8, 0), [8, 8]]);
+
 section('suspend, sign out, delete');
 $a = ['id' => $a['id'], 'tok' => (string) $x['json']['token']];
 panel('POST', '', ['do' => 'signout', 'csrf' => $csrf, 'uid' => $a['id']]);
